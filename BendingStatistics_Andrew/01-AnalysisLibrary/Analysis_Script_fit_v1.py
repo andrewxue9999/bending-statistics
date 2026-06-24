@@ -11,7 +11,7 @@ Created on Fri Apr 10 14:50:26 2026
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-# %matplotlib qt   # ADD BACK LATER
+%matplotlib qt
 from scipy.optimize import curve_fit
 from functools import partial
 
@@ -45,15 +45,21 @@ def derivative_deflection_bent_ribbon(x,d0,L):
 # Load Data Files
 # ==============================================================================
 # ---- Load specific coordinate file -------------------------------------------
-coord_file = "results/coords_Image0005_155649.txt" # Change to your latest file
+# coord_file = "results/coords_Image0005_155649.txt" # !!! CHANGE TO LATEST FILE
+coord_file = "results/coords_BBGcg0_tap_0011_223541.txt" # !!! CHANGE TO LATEST FILE
 coord_data = np.loadtxt(coord_file)
 Xt, Yt = coord_data[:, 0], coord_data[:, 1]
-X=Xt-Xt.min()
-Y=Yt-Yt.min()
+# X=Xt-Xt.min()
+# Y=Yt-Yt.min()
+X = Yt - Yt.min()
+Y = Xt - Xt.min()
+
 
 # ---- load data ------------------------------------------------------
-filename_bend='../../Data/Image0005.ibw'
-Stack = 'Trevor_WSe2_tgr3'
+# filename_bend='../../Data/Image0005.ibw'
+# Stack = 'Trevor_WSe2_tgr3'
+filename_bend='../00-AFM_Images/BBGcg0_tap_0011.ibw' # !!! CHANGE TO LATEST FILE
+Stack = 'errorstack'
 data_bent=LD.JupiterAFM_loadData_toDict(filename_bend, Stack)
 # print(data_unbent)
 data_labels=data_bent['labels']
@@ -118,7 +124,9 @@ np.savetxt(f"results/displacement.txt", np.column_stack([X, deflection_data]),
 #deflection_bent = deflection_bent_ribbon # partial(deflection_bent_ribbon, L=31.2)
 mask_d= X >10
 d_opt,d_cov=curve_fit(deflection_bent_ribbon, X[mask_d],deflection_data[mask_d])
-derr=np.sqrt(np.diag(p_cov)) 
+# derr=np.sqrt(np.diag(p_cov)) # NOTE: change p_cov to d_cov? d_cov is covariance from the deflection fit. 
+derr=np.sqrt(np.diag(d_cov))
+
 print(f"Fit Results displacement: d(x)=d0*(x/L-1)^3")
 print(f'dopt={d_opt}')
 print(f" d0: {d_opt[0]:.4e} ± {derr[0]:.4e}")
@@ -232,5 +240,6 @@ ax[3].set_xlabel("X (um)")
 ax[3].set_ylabel(f"$ \\Delta \\theta$  (degree)")
 
 
-plt.savefig(f"Image05_lowerEdge.png")
+# plt.savefig(f"Image05_lowerEdge.png") # CHANGE THIS NAME
+plt.savefig(f"BBGcg0_tap_0011.png")
 plt.tight_layout()

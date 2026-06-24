@@ -108,5 +108,6 @@ class AFM_Digitizer:
 
 if __name__ == "__main__":
     # Ensure correct params
-    app = AFM_Digitizer('../../Data/Image0005.ibw', 'Trevor_WSe2_tgr3')
+    # app = AFM_Digitizer('../../Data/Image0005.ibw', 'Trevor_WSe2_tgr3')
+    app = AFM_Digitizer("../00-AFM_Images/BBGcg0_tap_0011.ibw", "errorstack")
     plt.show(block=True)

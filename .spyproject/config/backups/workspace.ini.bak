@@ -1,0 +1,12 @@
+[workspace]
+restore_data_on_startup = True
+save_data_on_exit = True
+save_history = True
+save_non_project_files = False
+project_type = 'empty-project-type'
+recent_files = ['BendingStatistics_Andrew/01-AnalysisLibrary/Analysis_Script.py', 'BendingStatistics_Andrew/01-AnalysisLibrary/Asylum_LoadData_v3.py', 'BendingStatistics_Andrew/01-AnalysisLibrary/Edge_detector_script.py', 'BendingStatistics_Andrew/01-AnalysisLibrary/Analysis_Script_fit_v1.py', 'BendingStatistics_Andrew/01-AnalysisLibrary/results/displacement.txt', '../../../../../Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/site-packages/scipy/optimize/_minpack_py.py', 'BendingStatistics_Andrew/01-AnalysisLibrary/Asylum_plotData_v2.py']
+
+[main]
+version = 0.2.0
+recent_files = []
+

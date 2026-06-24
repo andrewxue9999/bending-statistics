@@ -11,7 +11,7 @@ Created on Fri Apr 10 14:50:26 2026
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-# %matplotlib qt    # ADD BACK LATER 
+%matplotlib qt
 from scipy.optimize import curve_fit
 
 #import own library
@@ -32,12 +32,13 @@ def line(x, m, q):
     return m*x + q
 
 # Load specific coordinate file
-coord_file = "results/coords_Image0005_155649.txt" # Change to your latest file
+coord_file = "results/coords_BBGcg0_tap_0001_182818.txt" # Change to your latest file
 coord_data = np.loadtxt(coord_file)
 X, Y = coord_data[:, 0], coord_data[:, 1]
 
 #load data
-filename_bend='../../Data/Image0005.ibw'
+# filename_bend='../../Data/Image0005.ibw'
+filename_bend='../00-AFM_Images/BBGcg0_tap_0001.ibw'
 Stack = 'Trevor_WSe2_tgr3'
 data_bent=LD.JupiterAFM_loadData_toDict(filename_bend, Stack)
 # print(data_unbent)
@@ -145,5 +146,5 @@ ax[2].scatter(X, np.abs(Y-line(X, *l_opt)), color='black')#, label='Snapped Data
 ax[2].set_title('|Data - linear reference|')
 ax[2].set_xlabel("X (um)")
 ax[2].set_ylabel("d (um)")
-plt.savefig(f"Image05_lowerEdge.png")
+plt.savefig(f"Image05_lowerEdge.png") # CHANGE NAME IF FILE TO BE USED IN FUTURE
 plt.tight_layout()

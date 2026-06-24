@@ -1,0 +1,1 @@
+filename    Mode    Scan size    X Offset    Y Offset    Scan Angle    #Points    #Lines
