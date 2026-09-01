@@ -1,0 +1,7 @@
+BBGcg0_tap_0011: 3.42
+bBLG_WSe2_push0011: 3.5
+cg20_AfterPush0004: 2.91
+cg24_push_0014: 4.05
+cg30_TapAfter0000: 5.3
+MBLG_cg26_Push2_0004: 5.9
+MBLG21_duringPush0007: 2.74

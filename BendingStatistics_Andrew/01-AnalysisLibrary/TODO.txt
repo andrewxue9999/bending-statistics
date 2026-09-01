@@ -1,0 +1,27 @@
+Analysis_Script_direct_compare.ipy changes:
+
+- look into 4.05 um width ribbon (cg24_push_0014)
+    - why is the behavior off from the trend?
+        - 
+- annotate Analysis_Script_direct_compare.ipy, Bend_Fitvar_Plot.ipy, Analysis_Script_fit_v1.ipy
+    - send:
+        - Analysis_Script_direct_compare.ipy
+        - Bend_Fitvar_Plot.ipy
+        - Analysis_Script_fit_v1.ipy
+        - mask_values.txt
+        - ribbon_width_values_um.txt
+
+- why don't linear fit and direct compare analyses have the same corresponding x_split values?
+    - L values not matching up between linear fit and direct compare?
+
+
+- remove projected_x option completely ?
+
+
+- reclick bBLG_WSe2 ? 
+    - look into potential reclick for a bunch of image pairs
+- readjust x_split based on actual visual split in overlap image
+    - revisit usage of absolute value for both fit_v1 and direct_compare
+
+- check estimate_rigid_transform() math logic
+- check if lining up pre/post points is applied first or if broader pre/post images are aligned first (images should probably be aligned first?)

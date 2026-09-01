@@ -1,0 +1,1626 @@
+# %%
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Creates a plot that looks at d(x) from data_postBend - data_preBend instead of
+|data - linearREF| (as in Analysis_Script_fit_v1.py).
+Then, creates a plot of the local twist angle based on the d(x) plot. 
+
+This script uses two methodologies to match the before and after traces. 
+The first matches the traces by a fitted curve parameterization of the ribbon edge, 
+and samples both traces at the same arclength along the ribbon. 
+The second matches the traces by the user-selected corresponding points. 
+
+In order for this script to be compatible with both methods, the before/after coordinate trace files 
+should contain the same number of clicked points. 
+
+Both traces are interpolated at the same coordinate along the ribbon, and deflection is calculated as the signed displacement of the post trace along the local normal of the pre trace:
+    d(s) = (r_post(s) - r_pre(s)) . n_pre(s)
+
+Align the before and after AFM images before clicking points whenever
+possible. Otherwise global scan translation/rotation will be included in d(s).
+"""
+
+# ==============================================================================
+# region - Imports and path setting
+# ==============================================================================
+
+from typing import Final
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import TypedDict
+import matplotlib
+%matplotlib qt
+from matplotlib.widgets import Button
+from mpl_point_clicker import clicker
+from scipy.optimize import curve_fit
+import os
+import pathlib
+import sys
+import csv
+
+libpath=os.path.join(pathlib.Path(__file__).parents[3], '00-Library/')
+print(libpath)
+sys.path.insert(1,libpath)
+import Asylum_LoadData_v3 as LD
+import Asylum_plotData_v2 as PD
+
+# ==============================================================================
+# endregion
+# ==============================================================================
+
+
+# ==============================================================================
+# region - IMPORTANT!!! CHECK BEFORE EVERY USE. User-defined analysis arguments
+# ==============================================================================
+
+PRE_FILE_NAME: Final[str] = "MBLG21_beforePush0002"
+PRE_FILE_TIME: Final[str] = "160427"
+
+POST_FILE_NAME: Final[str] = "MBLG21_duringPush0007"
+POST_FILE_TIME: Final[str] = "161441"
+
+SAMPLE_METHOD: Final[str] = "arc_length" # "arc_length" or "projected_x"
+N_SAMPLES: Final[int] = 200
+SWAP_XY: Final[bool] = True
+x_split: Final[float] = 27 # CHANGE FOR LATEST FILE -> split point where ribbon begins visibly bending
+REGISTRATION_MAX_LOO_RMSE_UM: Final[float] = 1.0
+REGISTRATION_MAX_LOO_POINT_ERROR_UM: Final[float] = 2.0
+
+# ==============================================================================
+# endregion
+# ==============================================================================
+
+
+# ==============================================================================
+# region - Define Class/Functions
+# ==============================================================================
+
+class Trace(TypedDict):
+    """
+    A dictionary containing coordinate data.
+
+    coord_file: str referring to the relative path of the coordinate file used to generate the trace.
+    Xt: np.ndarray[tuple[int], np.dtype[np.float64]] of x-coordinates of clicked points in the *original* coordinate system.
+    Yt: np.ndarray[tuple[int], np.dtype[np.float64]] of y-coordinates of clicked points in the *original* coordinate system.
+    X: np.ndarray[tuple[int], np.dtype[np.float64]] of neutral axis coordinates of clicked points sorted in ascending order.
+    Y: np.ndarray[tuple[int], np.dtype[np.float64]] of transverse displacement coordinates relative to the neutral axis, each corresponding by index to sorted "X" coordinates.
+    """
+
+    coord_file: str
+    Xt: np.ndarray[tuple[int], np.dtype[np.float64]]
+    Yt: np.ndarray[tuple[int], np.dtype[np.float64]]
+    X: np.ndarray[tuple[int], np.dtype[np.float64]]
+    Y: np.ndarray[tuple[int], np.dtype[np.float64]]
+
+class ClickPointPicker:
+    """
+    Interactive matplotlib point picker for selecting registration landmarks on an AFM image.
+    """
+
+    def __init__(self, image_data: dict, title: str) -> None:
+        """
+        Initializes the picker window, image display, click handler, and save button.
+        """
+
+        # load and transpose immediately for visual correctness
+        self.image_data = image_data
+        self.title = title
+        self.data_label = image_data["labels"][1]
+        self.data = image_data["data"][self.data_label].T
+
+        # use micron ranges
+        self.um_x = float(image_data.get("xrange", 0)) * 1e6
+        self.um_y = float(image_data.get("yrange", 0)) * 1e6
+
+        # setup figure 
+        self.fig, self.ax = plt.subplots(figsize=(10, 8))
+        self.fig.canvas.manager.set_window_title(title)
+        plt.subplots_adjust(bottom=0.2)
+
+        # contrast clipping (1st and 99th percentiles)
+        finite_data = self.data[np.isfinite(self.data)]
+        vmin, vmax = np.percentile(finite_data, [1, 99])
+
+        # transposed plotting: matches hover coords to saved coords
+        self.im = self.ax.imshow(
+            self.data,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax,
+            origin="lower",
+            extent=[0, self.um_x, 0, self.um_y],
+            aspect="equal",
+        )
+        plt.colorbar(self.im, ax=self.ax, label="Height (m)")
+        self.ax.set_title(title)
+        self.ax.set_xlabel("X (um)")
+        self.ax.set_ylabel("Y (um)")
+
+        self.point_clicker = clicker(self.ax, ["registration"], markers=["x"], colors=["red"])
+        self.fig.canvas.mpl_connect("scroll_event", self.handle_zoom)
+
+        self.btn_ax = plt.axes([0.7, 0.05, 0.18, 0.075])
+        self.btn = Button(self.btn_ax, "Save & Exit", color="honeydew")
+        self.btn.on_clicked(self.close_app)
+
+    def handle_zoom(self, event) -> None:
+        """
+        Zooms the picker axes around the mouse cursor using the scroll wheel.
+        """
+
+        if event.inaxes != self.ax:
+            return
+
+        base_scale = 1.3
+        cur_xlim = self.ax.get_xlim()
+        cur_ylim = self.ax.get_ylim()
+        scale_factor = 1 / base_scale if event.button == "up" else base_scale
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+        rel_x = (cur_xlim[1] - event.xdata) / (cur_xlim[1] - cur_xlim[0])
+        rel_y = (cur_ylim[1] - event.ydata) / (cur_ylim[1] - cur_ylim[0])
+
+        self.ax.set_xlim([event.xdata - new_width * (1 - rel_x), event.xdata + new_width * rel_x])
+        self.ax.set_ylim([event.ydata - new_height * (1 - rel_y), event.ydata + new_height * rel_y])
+        self.fig.canvas.draw_idle()
+
+    def close_app(self, event) -> None:
+        """
+        Closes the picker window when the user clicks Save & Exit.
+        """
+
+        plt.close(self.fig)
+
+    def get_points(self) -> np.ndarray:
+        """
+        Returns the selected registration points as an Nx2 array.
+        """
+
+        return np.asarray(self.point_clicker.get_positions()["registration"], dtype=float)
+
+def ask_to_continue() -> None:
+    """
+    Prompts the user to press enter to continue or 'x' to exit.
+    This allows the user time to check terminal outputs with front panel values, read instructions, etc.
+    """
+    user_input = input("\nPress enter to continue or 'x' to exit program: ")
+
+    while(user_input not in ("", "x")):
+        user_input = input("Press enter to continue or 'x' to exit program: ")
+
+    if user_input == "x":
+        sys.exit("User prompted program exit ('x').")
+    else:
+        print("\nProceeding.\n")
+
+def prompt_sample_method(default_sample_method: str) -> str:
+    """
+    Prompts the user to choose the trace sampling method.
+
+    Args:
+        default_sample_method (str): The default sampling method to use if the user presses enter.
+    
+    Returns:
+        str: The selected sampling method, either "arc_length" or "projected_x".
+    """
+
+    print("\nChoose trace sampling method:")
+    print("  1: arc_length")
+    print("  2: projected_x")
+    user_input = input(f"Enter 1 or 2. Press enter for {default_sample_method}: ").strip()
+
+    if user_input == "":
+        print(f"Using SAMPLE_METHOD = {default_sample_method}\n")
+        return default_sample_method
+
+    while user_input not in ("1", "2"):
+        user_input = input(f"Enter 1 for arc_length, 2 for projected_x, or press enter for {default_sample_method}: ").strip()
+        if user_input == "":
+            print(f"Using SAMPLE_METHOD = {default_sample_method}\n")
+            return default_sample_method
+
+    sample_method = "arc_length" if user_input == "1" else "projected_x"
+    print(f"Using SAMPLE_METHOD = {sample_method}\n")
+    return sample_method
+
+def prompt_swap_xy(default_swap_xy: bool) -> bool:
+    """
+    Prompts the user to decide whether image X/Y coordinates should be swapped for analysis.
+
+    Args:
+        default_swap_xy (bool): The default swap_xy value to use if the user presses enter.
+
+    Returns:
+        bool: The selected swap_xy value.
+    """
+
+    default_text = "yes" if default_swap_xy else "no"
+    print("\nChoose analysis-axis orientation:")
+    print("Swap X/Y axes after registration?")
+    print(f"Press enter for default ({default_text}).")
+    print("'Yes' should be used when dealing with vertical ribbons so that analysis X runs along the ribbon edge.")
+    print("This means the image itself does not need to be rotated so the unbent trace aligns with a display axis.")
+    user_input = input(f"Swap X/Y axes? [{'Y/n' if default_swap_xy else 'y/N'}]: ").strip().lower()
+
+    while user_input not in ("", "y", "yes", "n", "no"):
+        user_input = input(f"Enter yes/no, or press enter for {default_text}: ").strip().lower()
+
+    should_swap_xy = default_swap_xy if user_input == "" else user_input in ("y", "yes")
+    print(f"Using swap_xy = {should_swap_xy}\n")
+    return should_swap_xy
+
+def prompt_n_samples(default_n_samples: int) -> int:
+    """
+    Prompts the user for the number of interpolated samples to use along the trace in order to construct the d(x) profile.
+
+    Args:
+        default_n_samples (int): The default number of samples to use if the user presses enter.
+    
+    Returns:
+        int: The selected number of samples.
+    """
+
+    user_input = input(f"\nHow many interpolated trace samples should be used? Press enter for {default_n_samples}: ").strip()
+
+    if user_input == "":
+        print(f"Using N_SAMPLES = {default_n_samples}\n")
+        return default_n_samples
+
+    while True:
+        try:
+            n_samples = int(user_input)
+            if n_samples > 0:
+                print(f"Using N_SAMPLES = {n_samples}\n")
+                return n_samples
+        except ValueError:
+            pass
+        user_input = input(f"Enter a positive integer, or press enter for {default_n_samples}: ").strip()
+        if user_input == "":
+            print(f"Using N_SAMPLES = {default_n_samples}\n")
+            return default_n_samples
+
+def prompt_registration_mode(default_registration_mode: str) -> str:
+    """
+    Prompts the user to choose how registration and transformed coordinates should be handled.
+
+    Args:
+        default_registration_mode (str): The default registration mode to use if the user presses enter. "reuse", "retransform", or "new".
+
+    Returns:
+        str: The selected registration mode.
+    """
+
+    print("\nChoose registration mode:")
+    print("  1: reuse existing registration points and transformed trace coordinates; fastest re-analysis when registration points, transformation, and x_split are unchanged")
+    print("  2: reuse existing registration points, create a fresh transformation, then analyze; use this when changing x_split but keeping the same clicked registration points")
+    print("  3: click new registration points, create a fresh transformation, then analyze; use this for new registration points")
+    user_input = input(f"Enter 1, 2, or 3. Press enter for {default_registration_mode}: ").strip()
+
+    if user_input == "":
+        print(f"Using registration mode = {default_registration_mode}\n")
+        return default_registration_mode
+
+    while user_input not in ("1", "2", "3"):
+        user_input = input(
+            "Enter 1 to reuse transformed coords, 2 to rebuild from saved registration points, "
+            f"3 to click new registration points, or press enter for {default_registration_mode}: "
+        ).strip()
+        if user_input == "":
+            print(f"Using registration mode = {default_registration_mode}\n")
+            return default_registration_mode
+
+    mode_options = {
+        "1": "reuse",
+        "2": "retransform",
+        "3": "new",
+    }
+    registration_mode = mode_options[user_input]
+    print(f"Using registration mode = {registration_mode}\n")
+    return registration_mode
+
+def estimate_rigid_transform(
+    pre_points: np.ndarray,
+    post_points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Estimates R and t for p_post ~= R @ p_pre + t using a least-squares rigid transform.
+
+    Args:
+        pre_points (np.ndarray): An Nx2 array of points in the pre-image coordinate system.
+        post_points (np.ndarray): An Nx2 array of points in the post-image coordinate system.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: The estimated rotation matrix and translation vector.
+    """
+
+    pre_centroid = pre_points.mean(axis=0) # axis=0 -> calculate mean column-wise
+    post_centroid = post_points.mean(axis=0)
+    pre_centered = pre_points - pre_centroid
+    post_centered = post_points - post_centroid
+
+    h_matrix = pre_centered.T @ post_centered
+    u_matrix, _, vt_matrix = np.linalg.svd(h_matrix)
+    rotation = vt_matrix.T @ u_matrix.T
+
+    if np.linalg.det(rotation) < 0:
+        vt_matrix[-1, :] *= -1
+        rotation = vt_matrix.T @ u_matrix.T
+
+    translation = post_centroid - pre_centroid @ rotation.T
+    return rotation, translation
+
+def apply_rigid_transform(
+    points: np.ndarray, 
+    rotation: np.ndarray, 
+    translation: np.ndarray
+) -> np.ndarray:
+    """
+    Applies a 2D rigid transform to an array of points.
+
+    Args:
+        points (np.ndarray): An Nx2 array of points to apply the rigid transform to.
+        rotation (np.ndarray): A 2x2 rotation matrix.
+        translation (np.ndarray): A 1x2 translation vector.
+
+    Returns:
+        np.ndarray: The transformed points.
+    """
+
+    return points @ rotation.T + translation
+
+def registration_residuals(
+    pre_points: np.ndarray,
+    post_points: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray
+) -> np.ndarray:
+    """
+    Calculates pointwise registration errors after applying a rigid transform.
+    """
+
+    predicted_post = apply_rigid_transform(pre_points, rotation, translation)
+    return np.linalg.norm(post_points - predicted_post, axis=1)
+
+def leave_one_out_registration_residuals(
+    pre_points: np.ndarray,
+    post_points: np.ndarray
+) -> np.ndarray:
+    """
+    Calculates leave-one-out registration residuals for each point pair.
+    """
+
+    loo_residuals = np.zeros(len(pre_points), dtype=float)
+
+    for point_idx in range(len(pre_points)):
+        keep_mask = np.ones(len(pre_points), dtype=bool)
+        keep_mask[point_idx] = False
+        rotation_i, translation_i = estimate_rigid_transform(pre_points[keep_mask], post_points[keep_mask])
+        predicted_post_i = apply_rigid_transform(pre_points[point_idx:point_idx + 1], rotation_i, translation_i)
+        loo_residuals[point_idx] = np.linalg.norm(post_points[point_idx] - predicted_post_i[0])
+
+    return loo_residuals
+
+def save_registration_points(
+    pre_points: np.ndarray,
+    post_points: np.ndarray,
+    suffix: str
+) -> None:
+    """
+    Saves clicked pre/post image landmark pairs to the results directory.
+    """
+
+    out = pathlib.Path("results")
+    out.mkdir(exist_ok=True)
+    output_path = out / f"registration_points_{suffix}.txt"
+    np.savetxt(
+        output_path,
+        np.column_stack([pre_points[:, 0], pre_points[:, 1], post_points[:, 0], post_points[:, 1]]),
+        header="x_pre_image y_pre_image x_post_image y_post_image",
+        comments="",
+        fmt="%.10f",
+    )
+    print(f"Saved registration points to {output_path}")
+
+def load_registration_points(
+    suffix: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Loads saved pre/post image landmark pairs from the results directory.
+    """
+
+    registration_path = pathlib.Path("results") / f"registration_points_{suffix}.txt"
+    if not registration_path.exists():
+        raise FileNotFoundError(
+            f"Could not find {registration_path}. Click new registration points first."
+        )
+
+    registration_data = np.loadtxt(registration_path, skiprows=1)
+    registration_data = np.atleast_2d(registration_data)
+
+    if registration_data.shape[1] != 4:
+        raise ValueError(f"{registration_path} must contain columns: x_pre_image y_pre_image x_post_image y_post_image")
+
+    pre_points = registration_data[:, 0:2]
+    post_points = registration_data[:, 2:4]
+
+    if len(pre_points) < 3:
+        raise ValueError(f"{registration_path} contains fewer than 3 point pairs.")
+
+    return pre_points, post_points
+
+def pick_registration_points(
+    image_data: dict,
+    title: str
+) -> np.ndarray:
+    """
+    Opens the point-clicking GUI and returns selected image registration points.
+    """
+
+    print(f"\nOpening GUI for {title}.")
+    print("Click matching registration landmarks. Close the GUI window, or press Save & Exit, to continue.")
+    picker = ClickPointPicker(image_data, title)
+    plt.show(block=True)
+    points = picker.get_points()
+    print(f"Selected {len(points)} points for {title}.")
+    return points
+
+def register_pre_to_post(
+    data_pre: dict,
+    data_post: dict,
+    suffix: str
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Prompts for registration landmarks and estimates a rigid pre-to-post image transform.
+    """
+
+    print("\nRegistration landmark selection:")
+    print("Select at least 3 matching points in both the pre and post images; 6-8 points is recommended.")
+    print("Use recognizable landmarks such as dark spots, pattern edges, scratches, or corners.")
+    print("For every point clicked in the pre image, click the same physical spot in the post image, in the same order.")
+    print("Spread points across the full image, especially near corners. Avoid points that are too clustered or nearly collinear.")
+    ask_to_continue()
+
+    while True:
+        pre_points = pick_registration_points(data_pre, "pre-bend registration points")
+        post_points = pick_registration_points(data_post, "post-bend registration points")
+
+        if len(pre_points) != len(post_points):
+            print(f"Registration failed: selected {len(pre_points)} pre points but {len(post_points)} post points.")
+            print("For every pre point, select the matching post point in the same order.")
+            ask_to_continue()
+            continue
+        if len(pre_points) < 3:
+            print("Registration failed: at least 3 matching point pairs are required.")
+            ask_to_continue()
+            continue
+
+        rotation, translation = estimate_rigid_transform(pre_points, post_points)
+        residuals = registration_residuals(pre_points, post_points, rotation, translation)
+        rmse = np.sqrt(np.mean(residuals**2))
+        loo_residuals = leave_one_out_registration_residuals(pre_points, post_points)
+        loo_rmse = np.sqrt(np.mean(loo_residuals**2))
+        loo_max = loo_residuals.max()
+
+        print(f"Registration RMSE: {rmse:.4f} um")
+        print(f"Leave-one-out RMSE: {loo_rmse:.4f} um")
+        print(f"Leave-one-out max point error: {loo_max:.4f} um")
+
+        if (
+            loo_rmse > REGISTRATION_MAX_LOO_RMSE_UM
+            or loo_max > REGISTRATION_MAX_LOO_POINT_ERROR_UM
+        ):
+            print("Registration failed: leave-one-out residuals are too large.")
+            print("Please select better matching landmarks and avoid clustered or nearly collinear points.")
+            ask_to_continue()
+            continue
+
+        save_registration_points(pre_points, post_points, suffix)
+        print("\nSuccess: registration points accepted.")
+        print("Proceeding with rigid transformation.\n")
+        return rotation, translation, rmse
+
+def convert_image_to_analysis_coords(
+    image_points: np.ndarray,
+    should_swap_xy: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Converts image-coordinate point arrays into the analysis coordinate convention.
+    """
+
+    if should_swap_xy:
+        return image_points[:, 1], image_points[:, 0]
+    return image_points[:, 0], image_points[:, 1]
+
+def rebuild_trace_after_registration(
+    trace: Trace,
+    rotation: np.ndarray | None,
+    translation: np.ndarray | None,
+    should_swap_xy: bool
+) -> Trace:
+    """
+    Applies an optional rigid transform to trace image coordinates and rebuilds analysis coordinates.
+    """
+
+    image_points = np.column_stack([trace["Xt"], trace["Yt"]])
+    if rotation is not None and translation is not None:
+        image_points = apply_rigid_transform(image_points, rotation, translation)
+
+    x_analysis, y_analysis = convert_image_to_analysis_coords(image_points, should_swap_xy)
+    sort_idx = np.argsort(x_analysis)
+
+    return {
+        "coord_file": trace["coord_file"],
+        "Xt": image_points[:, 0],
+        "Yt": image_points[:, 1],
+        "X": x_analysis[sort_idx],
+        "Y": y_analysis[sort_idx],
+    }
+
+def sorted_image_and_analysis_points(
+    trace: Trace,
+    should_swap_xy: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns image and analysis coordinates sorted by analysis X.
+    """
+
+    image_points = np.column_stack([trace["Xt"], trace["Yt"]])
+    x_analysis, y_analysis = convert_image_to_analysis_coords(image_points, should_swap_xy)
+    sort_idx = np.argsort(x_analysis)
+    return (
+        image_points[sort_idx, 0],
+        image_points[sort_idx, 1],
+        x_analysis[sort_idx],
+        y_analysis[sort_idx],
+    )
+
+def image_points_by_projected_x(
+    trace: Trace,
+    sample_coord: np.ndarray,
+    should_swap_xy: bool
+) -> np.ndarray:
+    """
+    Interpolates image coordinates at specified analysis-X coordinates.
+    """
+
+    image_x, image_y, x_analysis, _ = sorted_image_and_analysis_points(trace, should_swap_xy)
+    x_unique, image_x_unique = average_duplicate_samples(x_analysis, image_x)
+    _, image_y_unique = average_duplicate_samples(x_analysis, image_y)
+    return np.column_stack([
+        np.interp(sample_coord, x_unique, image_x_unique),
+        np.interp(sample_coord, x_unique, image_y_unique),
+    ])
+
+def image_points_by_arclength(
+    trace: Trace,
+    sample_coord: np.ndarray,
+    should_swap_xy: bool
+) -> np.ndarray:
+    """
+    Interpolates image coordinates at specified analysis arclength coordinates.
+    """
+
+    image_x, image_y, x_analysis, y_analysis = sorted_image_and_analysis_points(trace, should_swap_xy)
+    s = get_cumulative_distance_array(x_analysis, y_analysis)
+    s_unique, image_x_unique = average_duplicate_samples(s, image_x)
+    _, image_y_unique = average_duplicate_samples(s, image_y)
+    return np.column_stack([
+        np.interp(sample_coord, s_unique, image_x_unique),
+        np.interp(sample_coord, s_unique, image_y_unique),
+    ])
+
+def trace_alignment_pairs_before_x_split(
+    pre_trace: Trace,
+    post_trace: Trace,
+    sample_method: str,
+    x_split: float,
+    n_samples: int,
+    should_swap_xy: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Builds corresponding pre/post trace point pairs before x_split for trace-alignment refinement.
+    """
+
+    alignment_samples = max(3, min(n_samples, 100))
+
+    if sample_method == "arc_length":
+        _, _, pre_x, pre_y = sorted_image_and_analysis_points(pre_trace, should_swap_xy)
+        _, _, post_x, post_y = sorted_image_and_analysis_points(post_trace, should_swap_xy)
+        s_pre = get_cumulative_distance_array(pre_x, pre_y)
+        s_post = get_cumulative_distance_array(post_x, post_y)
+        sample_min = 0
+        sample_max = min(x_split, s_pre[-1], s_post[-1])
+        if sample_max <= sample_min:
+            raise ValueError("Cannot refine trace alignment: no shared pre-x_split arclength range.")
+        sample_coord = np.linspace(sample_min, sample_max, alignment_samples)
+        pre_points = image_points_by_arclength(pre_trace, sample_coord, should_swap_xy)
+        post_points = image_points_by_arclength(post_trace, sample_coord, should_swap_xy)
+    elif sample_method == "projected_x":
+        _, _, pre_x, _ = sorted_image_and_analysis_points(pre_trace, should_swap_xy)
+        _, _, post_x, _ = sorted_image_and_analysis_points(post_trace, should_swap_xy)
+        sample_min = max(pre_x.min(), post_x.min())
+        sample_max = min(x_split, pre_x.max(), post_x.max())
+        if sample_max <= sample_min:
+            raise ValueError("Cannot refine trace alignment: no shared pre-x_split projected-x range.")
+        sample_coord = np.linspace(sample_min, sample_max, alignment_samples)
+        pre_points = image_points_by_projected_x(pre_trace, sample_coord, should_swap_xy)
+        post_points = image_points_by_projected_x(post_trace, sample_coord, should_swap_xy)
+    else:
+        raise ValueError("SAMPLE_METHOD must be 'arc_length' or 'projected_x'")
+
+    valid_mask = np.all(np.isfinite(pre_points), axis=1) & np.all(np.isfinite(post_points), axis=1)
+    pre_points = pre_points[valid_mask]
+    post_points = post_points[valid_mask]
+    if len(pre_points) < 3:
+        raise ValueError("Cannot refine trace alignment: fewer than 3 valid pre-x_split trace point pairs.")
+    return pre_points, post_points
+
+def refine_pre_trace_alignment_before_x_split(
+    pre_trace: Trace,
+    post_trace: Trace,
+    sample_method: str,
+    x_split: float,
+    n_samples: int,
+    should_swap_xy: bool
+) -> tuple[Trace, float]:
+    """
+    Refines the transformed pre trace by aligning the pre-x_split trace segment to the post trace.
+    """
+
+    pre_points, post_points = trace_alignment_pairs_before_x_split(
+        pre_trace,
+        post_trace,
+        sample_method,
+        x_split,
+        n_samples,
+        should_swap_xy,
+    )
+    rotation, translation = estimate_rigid_transform(pre_points, post_points)
+    residuals = registration_residuals(pre_points, post_points, rotation, translation)
+    rmse = np.sqrt(np.mean(residuals**2))
+    refined_pre_trace = rebuild_trace_after_registration(pre_trace, rotation, translation, should_swap_xy)
+    print(f"Pre-x_split trace alignment RMSE after refinement: {rmse:.4f} um")
+    return refined_pre_trace, rmse
+
+def plot_registration_overlay(
+    data_pre: dict,
+    data_post: dict,
+    pre_trace: Trace,
+    post_trace: Trace,
+    rmse: float,
+    output_path: pathlib.Path | None = None,
+    show_overlay: bool = True
+) -> None:
+    """
+    Plots and optionally saves the registered pre/post image overlay using image coordinates.
+    """
+
+    pre_label = data_pre["labels"][1]
+    post_label = data_post["labels"][1]
+    pre_data = data_pre["data"][pre_label].T
+    post_data = data_post["data"][post_label].T
+    pre_um_x = float(data_pre.get("xrange", 0)) * 1e6
+    pre_um_y = float(data_pre.get("yrange", 0)) * 1e6
+    post_um_x = float(data_post.get("xrange", 0)) * 1e6
+    post_um_y = float(data_post.get("yrange", 0)) * 1e6
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    fig.canvas.manager.set_window_title("registration overlay")
+
+    ax.imshow(
+        post_data,
+        cmap="gray",
+        origin="lower",
+        extent=[0, post_um_x, 0, post_um_y],
+        aspect="equal",
+        alpha=0.85,
+    )
+    ax.imshow(
+        pre_data,
+        cmap="magma",
+        origin="lower",
+        extent=[0, pre_um_x, 0, pre_um_y],
+        aspect="equal",
+        alpha=0.35,
+    )
+    ax.scatter(pre_trace["Xt"], pre_trace["Yt"], s=4, color="tab:blue", label="pre trace transformed")
+    ax.scatter(post_trace["Xt"], post_trace["Yt"], s=4, color="crimson", label="post trace")
+    ax.set_title(f"Registered pre/post overlay; RMSE = {rmse:.4f} um")
+    ax.set_xlabel("image X (um)")
+    ax.set_ylabel("image Y (um)")
+    ax.set_xlim(0, post_um_x)
+    ax.set_ylim(0, post_um_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    if output_path is not None:
+        output_path.parent.mkdir(exist_ok=True)
+        plt.savefig(output_path)
+        print(f"Saved registered pre/post overlay to {output_path}")
+    if show_overlay:
+        plt.show()
+        ask_to_continue()
+    else:
+        plt.close(fig)
+
+def save_transformed_trace_coordinates(
+    pre_trace: Trace,
+    post_trace: Trace,
+    suffix: str
+) -> None:
+    """
+    Saves transformed analysis and image coordinates for the current pre/post trace pair.
+    """
+
+    out = pathlib.Path("results")
+    out.mkdir(exist_ok=True)
+    max_len = max(len(pre_trace["X"]), len(post_trace["X"]))
+    output = np.full((max_len, 8), np.nan, dtype=float)
+    output[:len(pre_trace["X"]), 0] = pre_trace["X"]
+    output[:len(post_trace["X"]), 1] = post_trace["X"]
+    output[:len(pre_trace["Y"]), 2] = pre_trace["Y"]
+    output[:len(post_trace["Y"]), 3] = post_trace["Y"]
+    output[:len(pre_trace["Xt"]), 4] = pre_trace["Xt"]
+    output[:len(pre_trace["Yt"]), 5] = pre_trace["Yt"]
+    output[:len(post_trace["Xt"]), 6] = post_trace["Xt"]
+    output[:len(post_trace["Yt"]), 7] = post_trace["Yt"]
+
+    output_path = out / f"transformed_{suffix}.txt"
+    np.savetxt(
+        output_path,
+        output,
+        header="x_pre x_post y_pre y_post x_pre_image y_pre_image x_post_image y_post_image",
+        comments="",
+        fmt="%.10f",
+    )
+    print(f"Saved transformed trace coordinates to {output_path}")
+
+def load_transformed_trace_coordinates(
+    suffix: str
+) -> tuple[Trace, Trace]:
+    """
+    Loads transformed trace coordinates saved by save_transformed_trace_coordinates().
+    """
+
+    transformed_path = pathlib.Path("results") / f"transformed_{suffix}.txt"
+    if not transformed_path.exists():
+        raise FileNotFoundError(
+            f"Could not find {transformed_path}. Use saved registration points to create a new transformation, or click new registration points first."
+        )
+
+    transformed_data = np.loadtxt(transformed_path, skiprows=1)
+    transformed_data = np.atleast_2d(transformed_data)
+
+    if transformed_data.shape[1] not in (4, 8):
+        raise ValueError(
+            f"{transformed_path} must contain columns: x_pre x_post y_pre y_post "
+            "with optional x_pre_image y_pre_image x_post_image y_post_image columns"
+        )
+
+    x_pre = transformed_data[:, 0]
+    x_post = transformed_data[:, 1]
+    y_pre = transformed_data[:, 2]
+    y_post = transformed_data[:, 3]
+    pre_mask = np.isfinite(x_pre) & np.isfinite(y_pre)
+    post_mask = np.isfinite(x_post) & np.isfinite(y_post)
+
+    if not np.any(pre_mask) or not np.any(post_mask):
+        raise ValueError(f"{transformed_path} does not contain usable pre and post trace coordinates.")
+
+    if transformed_data.shape[1] == 8:
+        x_pre_image = transformed_data[:, 4]
+        y_pre_image = transformed_data[:, 5]
+        x_post_image = transformed_data[:, 6]
+        y_post_image = transformed_data[:, 7]
+    else:
+        print(
+            f"Warning: {transformed_path} has legacy 4-column transformed coordinates. "
+            "Regenerate this file with registration mode 2 or 3 for image-coordinate overlay consistency."
+        )
+        x_pre_image = x_pre
+        y_pre_image = y_pre
+        x_post_image = x_post
+        y_post_image = y_post
+
+    pre_sort_idx = np.argsort(x_pre[pre_mask])
+    post_sort_idx = np.argsort(x_post[post_mask])
+
+    pre_trace = {
+        "coord_file": str(transformed_path),
+        "Xt": x_pre_image[pre_mask][pre_sort_idx],
+        "Yt": y_pre_image[pre_mask][pre_sort_idx],
+        "X": x_pre[pre_mask][pre_sort_idx],
+        "Y": y_pre[pre_mask][pre_sort_idx],
+    }
+    post_trace = {
+        "coord_file": str(transformed_path),
+        "Xt": x_post_image[post_mask][post_sort_idx],
+        "Yt": y_post_image[post_mask][post_sort_idx],
+        "X": x_post[post_mask][post_sort_idx],
+        "Y": y_post[post_mask][post_sort_idx],
+    }
+
+    print(f"Loaded transformed trace coordinates from {transformed_path}")
+    return pre_trace, post_trace
+
+def stored_registration_points_exist(registration_suffix: str) -> bool:
+    """
+    Checks whether saved registration points exist for a pre/post image pair.
+    """
+
+    registration_path = pathlib.Path("results") / f"registration_points_{registration_suffix}.txt"
+    return registration_path.exists()
+
+def stored_transformed_trace_exists(transformed_suffix: str) -> bool:
+    """
+    Checks whether saved transformed trace coordinates exist for a specific coord-file pair.
+    """
+
+    transformed_path = pathlib.Path("results") / f"transformed_{transformed_suffix}.txt"
+    return transformed_path.exists()
+
+def stored_registration_files_exist(registration_suffix: str, transformed_suffix: str) -> bool:
+    """
+    Checks whether both registration points and transformed trace coordinates exist.
+    """
+
+    return (
+        stored_registration_points_exist(registration_suffix)
+        and stored_transformed_trace_exists(transformed_suffix)
+    )
+
+def load_existing_registration_transform(
+    registration_suffix: str
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Loads saved registration points, validates them, and returns the rigid transform.
+    """
+
+    pre_points, post_points = load_registration_points(registration_suffix)
+    rotation, translation = estimate_rigid_transform(pre_points, post_points)
+    residuals = registration_residuals(pre_points, post_points, rotation, translation)
+    rmse = np.sqrt(np.mean(residuals**2))
+    loo_residuals = leave_one_out_registration_residuals(pre_points, post_points)
+    loo_rmse = np.sqrt(np.mean(loo_residuals**2))
+    loo_max = loo_residuals.max()
+
+    print(f"Loaded existing registration with {len(pre_points)} point pairs.")
+    print(f"Registration RMSE: {rmse:.4f} um")
+    print(f"Leave-one-out RMSE: {loo_rmse:.4f} um")
+    print(f"Leave-one-out max point error: {loo_max:.4f} um")
+
+    if (
+        loo_rmse > REGISTRATION_MAX_LOO_RMSE_UM
+        or loo_max > REGISTRATION_MAX_LOO_POINT_ERROR_UM
+    ):
+        raise ValueError(
+            "Stored registration failed leave-one-out residual checks. Click new registration points."
+        )
+
+    return rotation, translation, rmse
+
+def load_existing_registration_analysis(
+    registration_suffix: str,
+    transformed_suffix: str
+) -> tuple[Trace, Trace, float]:
+    """
+    Loads validated registration metadata and saved transformed trace coordinates.
+    """
+
+    _, _, rmse = load_existing_registration_transform(registration_suffix)
+    pre_trace, post_trace = load_transformed_trace_coordinates(transformed_suffix)
+    return pre_trace, post_trace, rmse
+
+def deflection_bent_ribbon(
+    x: float | np.ndarray[tuple[int], np.dtype[np.float64]],
+    d0: float, 
+    L: float
+) -> float | np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Calculates the deflection d(x) of a bent ribbon (as a function of distance along the neutral axis before bending (x)).
+
+    Note: There is no constant "+c" term in d(x), so fitted curves (with curve_fit()) should be zero referenced. 
+
+    Args:
+        x (float | np.ndarray[tuple[int], np.dtype[np.float64]]): Distance along neutral axis before bending. 
+        d0 (float): Deflection at the load point. 
+        L (float): Length over which bending occurs. 
+
+    Returns: 
+        float | np.ndarray[tuple[int], np.dtype[np.float64]]: Deflection d(x) at the given distance x. 
+    """
+
+    return d0/(L**3)*(x-L)**3
+
+def deflection_bent_ribbon_abs(
+    x: float | np.ndarray[tuple[int], np.dtype[np.float64]],
+    d0: float, 
+    L: float
+) -> float | np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Calculates the absolute value of the bent-ribbon displacement model.
+    """
+
+    return np.abs(deflection_bent_ribbon(x, d0, L))
+
+def derivative_deflection_bent_ribbon(
+    x: float | np.ndarray[tuple[int], np.dtype[np.float64]],
+    d0: float, 
+    L: float
+) -> float | np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Calculates the derivative of the deflection d(x) of a bent ribbon (as a function of distance along the neutral axis before bending (x)).
+
+    Args:
+        x (float | np.ndarray[tuple[int], np.dtype[np.float64]]): Distance along neutral axis before bending.
+        d0 (float): Deflection at the load point.
+        L (float): Length over which bending occurs.
+
+    Returns:
+        float | np.ndarray[tuple[int], np.dtype[np.float64]]: Derivative of deflection d'(x) at the given distance x.
+    """
+
+    return d0/(L**3)*3*(x-L)**2
+
+def deflection_bent_ribbon_local(
+    x_local: float | np.ndarray[tuple[int], np.dtype[np.float64]],
+    d0: float,
+    L: float
+) -> float | np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Evaluates the original displacement model on the increasing local-bend branch.
+
+    x_local is measured from the first sample used in the displacement fit. The
+    original model is preserved by evaluating it at x_model = x_local + L.
+    """
+
+    return deflection_bent_ribbon_abs(x_local + L, d0, L)
+
+def derivative_deflection_bent_ribbon_local(
+    x_local: float | np.ndarray[tuple[int], np.dtype[np.float64]],
+    d0: float,
+    L: float
+) -> float | np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Calculates the derivative of the local-coordinate bent-ribbon model.
+    """
+
+    return derivative_deflection_bent_ribbon(x_local + L, d0, L)
+
+FITVAR_COLUMNS = [
+    "x_split",
+    "fit_v1_file_name", "fit_v1_file_time",
+    "fit_v1_parabola_a", "fit_v1_parabola_b", "fit_v1_parabola_c",
+    "fit_v1_parabola_a_err", "fit_v1_parabola_b_err", "fit_v1_parabola_c_err",
+    "fit_v1_line_m", "fit_v1_line_q", "fit_v1_line_m_err", "fit_v1_line_q_err",
+    "fit_v1_d0", "fit_v1_L", "fit_v1_d0_err", "fit_v1_L_err",
+    "fit_v1_x", "fit_v1_d_signed", "fit_v1_d_abs", "fit_v1_d_fit",
+    "fit_v1_theta_x", "fit_v1_theta",
+    "|",
+    "direct_pre_file_name", "direct_pre_file_time",
+    "direct_post_file_name", "direct_post_file_time",
+    "direct_sample_method", "direct_n_samples",
+    "direct_registration_rmse", "direct_d0", "direct_L", "direct_d0_err", "direct_L_err",
+    "direct_x", "direct_d_signed", "direct_d_abs", "direct_d_fit",
+    "direct_theta_x", "direct_theta",
+]
+
+def format_fitvar_value(value):
+    """
+    Formats scalar values for fitvar tabular output.
+    """
+
+    if value == "|":
+        return "|"
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "nan"
+    try:
+        if np.isnan(value):
+            return "nan"
+    except TypeError:
+        pass
+    return f"{float(value):.10g}"
+
+def read_fitvar_rows(path):
+    """
+    Reads an existing fitvar TSV file, returning an empty list if it does not exist.
+    """
+
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+def write_fitvar_rows(path, rows):
+    """
+    Writes fitvar rows to a TSV file using FITVAR_COLUMNS.
+    """
+
+    path.parent.mkdir(exist_ok=True)
+    normalized_rows = []
+    for row in rows:
+        normalized_rows.append({column: row.get(column, "nan") for column in FITVAR_COLUMNS})
+        normalized_rows[-1]["|"] = "|"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FITVAR_COLUMNS, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        for row in normalized_rows:
+            writer.writerow({column: format_fitvar_value(row[column]) for column in FITVAR_COLUMNS})
+
+def save_direct_fitvars(
+    pre_file_name,
+    pre_file_time,
+    post_file_name,
+    post_file_time,
+    sample_method,
+    n_samples,
+    registration_rmse,
+    x_split,
+    d_opt,
+    derr,
+    sample_coord,
+    deflection_data,
+    deflection_magnitude,
+    fit_data,
+    theta_x,
+    theta
+):
+    """
+    Saves direct-compare fit parameters, sampled displacement data, and twist-angle data.
+    """
+
+    output_path = pathlib.Path("results") / f"fitvar_{post_file_name}_{post_file_time}.txt"
+    existing_rows = read_fitvar_rows(output_path)
+    row_count = max(len(sample_coord), len(theta), len(existing_rows), 1)
+    rows = []
+    for idx in range(row_count):
+        row = existing_rows[idx] if idx < len(existing_rows) else {}
+        row.update({
+            "x_split": x_split,
+            "direct_pre_file_name": pre_file_name,
+            "direct_pre_file_time": pre_file_time,
+            "direct_post_file_name": post_file_name,
+            "direct_post_file_time": post_file_time,
+            "direct_sample_method": sample_method,
+            "direct_n_samples": n_samples,
+            "direct_registration_rmse": registration_rmse,
+            "direct_d0": d_opt[0],
+            "direct_L": d_opt[1],
+            "direct_d0_err": derr[0],
+            "direct_L_err": derr[1],
+            "direct_x": sample_coord[idx] if idx < len(sample_coord) else np.nan,
+            "direct_d_signed": deflection_data[idx] if idx < len(deflection_data) else np.nan,
+            "direct_d_abs": deflection_magnitude[idx] if idx < len(deflection_magnitude) else np.nan,
+            "direct_d_fit": fit_data[idx] if idx < len(fit_data) else np.nan,
+            "direct_theta_x": theta_x[idx] if idx < len(theta_x) else np.nan,
+            "direct_theta": theta[idx] if idx < len(theta) else np.nan,
+        })
+        rows.append(row)
+    write_fitvar_rows(output_path, rows)
+    print(f"Saved fit variables to {output_path}")
+
+def load_coord_trace(
+    file_name: str, 
+    coord_file_time: str
+) -> Trace:
+    """
+    Loads coordinate trace from user-provided file name and time. Returns a dictionary containing coordinate data (also referred to as trace in other parts of file). 
+
+    This loads the raw clicked image coordinates. Analysis X/Y axes are assigned later after the registration and swap-axis prompt.
+
+    Args:
+        file_name (str): Base name of ibw file without extension (ex. provide "BBGcg0_tap_0001" for BBGcg0_tap_0001.ibw). Same as providing the corresponding coordinate file name without time or extension (ex. "BBGcg0_tap_0001" for coords_BBGcg0_tap_0001_152657.txt). 
+        coord_file_time (str): Time string corresponding to the coordinate file (ex. "152657" for coords_BBGcg0_tap_0001_152657.txt).
+    
+    Returns:
+        Trace: Trace object containing the following keys:
+            - "coord_file": str, relative path to the coordinate file.
+            - "Xt": np.ndarray[tuple[int], np.dtype[np.float64]], x-coordinates of clicked points in the *original* coordinate system.
+            - "Yt": np.ndarray[tuple[int], np.dtype[np.float64]], y-coordinates of clicked points in the *original* coordinate system.
+            - "X": np.ndarray[tuple[int], np.dtype[np.float64]], raw x-coordinates of clicked points sorted in ascending order.
+            - "Y": np.ndarray[tuple[int], np.dtype[np.float64]], raw y-coordinates corresponding by index to sorted "X" coordinates.
+    """
+
+    coord_file = "results/coords_" + file_name + "_" + coord_file_time + ".txt"
+    coord_data = np.loadtxt(coord_file)
+    Xt, Yt = coord_data[:, 0], coord_data[:, 1]
+
+    X = Xt
+    Y = Yt
+    sort_idx = np.argsort(X) # this indirect sort allows for user-selected points to be in any order relative to neutral axis (and not necessarily require clicking along one direction without clicking "backwards")
+
+    return {
+        "coord_file": coord_file,
+        "Xt": Xt,
+        "Yt": Yt,
+        "X": X[sort_idx],
+        "Y": Y[sort_idx]
+    }
+
+def set_origin(
+    trace: Trace, 
+    x_origin_offset: float, 
+    y_origin_offset: float
+) -> None:
+    """
+    Sets an origin for set of coordinates by subtracting constant X and Y offsets from the X and Y coordinates, regardless of whether an actual (0, 0) point results. This ensures that the before and after AFM image coordinates are aligned to the same origin (after both are processed through set_origin()), so that displacements are preserved.
+
+    Args:
+        trace (Trace): Trace object containing coordinate data with keys "X" and "Y" obtained from load_coord_trace().
+        x_origin_offset (float): Constant offset to subtract from all X coordinates.
+        y_origin_offset (float): Constant offset to subtract from all Y coordinates.
+    """
+
+    trace["X"] = trace["X"] - x_origin_offset
+    trace["Y"] = trace["Y"] - y_origin_offset
+
+def get_cumulative_distance_array(
+    x: np.ndarray[tuple[int], np.dtype[np.float64]], 
+    y: np.ndarray[tuple[int], np.dtype[np.float64]]
+) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Creates a prefix sum array of the cumulative distance along a set of points defined by x and y coordinates. 
+    The first element is always 0, and the last element is the total distance along the path.
+
+    Every element i in the returned array (for 1 <= i <= (len(x) - 1)) is the sum of the segment distances from point 0 through point i, 
+    where each segment distance between consecutive points j and j+1 ((x[j], y[j]) and (x[j+1], y[j+1])) is calculated as sqrt((x[j+1] - x[j])^2 + (y[j+1] - y[j])^2).
+    
+    Specifically, at index i in the returned array, the value is: 
+    sqrt((x[1] - x[0])^2 + (y[1] - y[0])^2) + sqrt((x[2] - x[1])^2 + (y[2] - y[1])^2) + ... + sqrt((x[i] - x[i-1])^2 + (y[i] - y[i-1])^2).
+    
+    Because distances are approximated as standard Euclidean distance, it is recommended to have more data points along the input trace (x, y) to 
+    increase the accuracy of cumulative distance calculation.
+
+    Args:
+        x (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of x-coordinates of points along a path.
+        y (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of y-coordinates of points along a path.
+    
+    Returns:
+        np.ndarray[tuple[int], np.dtype[np.float64]]: 1D array of cumulative distances along the path, with the same length as the input x and y arrays. The first element is 0, and the last element is the total distance along the path.
+    """
+
+    ds: np.ndarray[tuple[int], np.dtype[np.float64]] = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    return np.concatenate([[0], np.cumsum(ds)])
+
+# check terminology for clarity (coords_to_sample vs. sample_coord)
+def average_duplicate_samples(
+    coords_to_sample: np.ndarray[tuple[int], np.dtype[np.float64]], 
+    values: np.ndarray[tuple[int], np.dtype[np.float64]]
+) -> tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]:
+    """
+    Protects against duplicate sample coordinates by averaging the corresponding values.
+    With arclength sampling, this protects against double clicks, etc.. 
+    With projected x sampling, this also protects against a single x-coordinate corresponding to multiple y-coordinates or vice versa. 
+    This allows for the user to call np.interp() on a set of unique interpolation coordinates, as required by the function. 
+
+    Args:
+        coords_to_sample (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of coordinates to be interpolated along, which may contain duplicates.
+        values (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of values corresponding to (measured at) the coords_to_sample coordinates, with the same length as coords_to_sample.
+    
+    Returns:
+        tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]: A tuple containing the unique sample coordinates (first tuple element) and their corresponding averaged values (second tuple element). In other words, the original inputs but with no duplicate coords_to_sample entries, and their corresponding values (in values array) averaged.
+    """
+
+    unique_coord, inverse_construc_indices = np.unique(coords_to_sample, return_inverse=True)
+    averaged_values = np.zeros_like(unique_coord, dtype=float)
+    counts = np.zeros_like(unique_coord, dtype=float)
+
+    # Look at inverse_construc_indices and values elements in corresponding pairs. 
+    # Since inverse_construc_indices is meant for reconstructing the original coords_to_sample array from unique_coord, each element in inverse_construc_indices identifies
+    # which unique coordinate value (of unique_coord) corresponds to that original coords_to_sample entry. 
+    # A repeated element in inverse_construc_indices means that its corresponding coords_to_sample coordinate value is repeated, and the corresponding values (from values array) 
+    # should be averaged.
+    for idx, value in zip(inverse_construc_indices, values): 
+        averaged_values[idx] += value
+        counts[idx] += 1
+
+    return unique_coord, averaged_values / counts
+
+def sample_trace_by_arclength(
+    trace: Trace, 
+    sample_coord: np.ndarray[tuple[int], np.dtype[np.float64]]
+) -> tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]:
+    """
+    Linearly interpolates the x and y coordinates of a trace at specified arclength coordinates.
+
+    In other words, at this specific arclength value along the trace, what are the corresponding x and y coordinates?
+    
+    Args:
+        trace (Trace): Trace object containing coordinate data with keys "X" and "Y" obtained from load_coord_trace().
+        sample_coord (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of arclength coordinates at which to interpolate the trace's x and y coordinates.
+
+    Returns:
+        tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]: A tuple containing the interpolated x-coordinates (first tuple element) and y-coordinates (second tuple element) of the trace at the specified arclength coordinates. The returned arrays have the same length as sample_coord.
+    """
+
+    s = get_cumulative_distance_array(trace["X"], trace["Y"])
+    s_unique, x_unique = average_duplicate_samples(s, trace["X"])
+    _, y_unique = average_duplicate_samples(s, trace["Y"])
+
+    return np.interp(sample_coord, s_unique, x_unique), np.interp(sample_coord, s_unique, y_unique)
+
+def sample_trace_by_projected_x(
+    trace: Trace, 
+    sample_coord: np.ndarray[tuple[int], np.dtype[np.float64]]
+) -> tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]:
+    """
+    Linearly interpolates the y coordinates of a trace at specified x-coordinates. 
+
+    Args:
+        trace (Trace): Trace object containing coordinate data with keys "X" and "Y" obtained from load_coord_trace().
+        sample_coord (np.ndarray[tuple[int], np.dtype[np.float64]]): 1D array of x-coordinates at which to interpolate the trace's y coordinates.
+
+    Returns:
+        tuple[np.ndarray[tuple[int], np.dtype[np.float64]], np.ndarray[tuple[int], np.dtype[np.float64]]]: A tuple containing the sampled x-coordinates (first tuple element) and interpolated y-coordinates (second tuple element) of the trace at the specified x-coordinates. The returned arrays have the same length as sample_coord.
+    """
+
+    x_unique, y_unique = average_duplicate_samples(trace["X"], trace["Y"])
+    return sample_coord, np.interp(sample_coord, x_unique, y_unique)
+
+def build_interpolated_sample_coord(
+    sample_min: float,
+    sample_max: float,
+    n_samples: int
+) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Builds evenly spaced interpolation coordinates across the selected sampling range.
+
+    Args:
+        sample_min (float): Minimum coordinate value to sample.
+        sample_max (float): Maximum coordinate value to sample.
+        n_samples (int): Number of interpolated samples to generate.
+
+    Returns:
+        np.ndarray[tuple[int], np.dtype[np.float64]]: Evenly spaced sampling coordinates.
+    """
+
+    if n_samples <= 0:
+        raise ValueError("Error: No valid sample coordinates are available in the selected match range.")
+
+    return np.linspace(sample_min, sample_max, n_samples)
+
+def calculate_normal_displacement(
+    sample_coord: np.ndarray[tuple[int], np.dtype[np.float64]],
+    x_pre: np.ndarray[tuple[int], np.dtype[np.float64]],
+    y_pre: np.ndarray[tuple[int], np.dtype[np.float64]],
+    x_post: np.ndarray[tuple[int], np.dtype[np.float64]],
+    y_post: np.ndarray[tuple[int], np.dtype[np.float64]]
+) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
+    """
+    Calculates signed displacement of the post trace along the local normal of the pre trace.
+
+    d = (r_post - r_pre) dot n_pre
+    """
+
+    if len(sample_coord) < 2:
+        raise ValueError("At least 2 sample coordinates are required to calculate local normals.")
+
+    edge_order = 2 if len(sample_coord) >= 3 else 1
+    tangent_x = np.gradient(x_pre, sample_coord, edge_order=edge_order)
+    tangent_y = np.gradient(y_pre, sample_coord, edge_order=edge_order)
+    tangent_norm = np.sqrt(tangent_x**2 + tangent_y**2)
+
+    if np.any(tangent_norm == 0):
+        raise ValueError("Cannot calculate local normals because the pre trace has zero-length tangent samples.")
+
+    normal_x = -tangent_y / tangent_norm
+    normal_y = tangent_x / tangent_norm
+
+    displacement_x = x_post - x_pre
+    displacement_y = y_post - y_pre
+    return displacement_x * normal_x + displacement_y * normal_y
+
+def sample_traces(
+    pre_trace: Trace, 
+    post_trace: Trace, 
+    sample_method: str, 
+    n_samples: int
+) -> tuple[np.ndarray[tuple[int], np.dtype[np.float64]], 
+           np.ndarray[tuple[int], np.dtype[np.float64]], 
+           np.ndarray[tuple[int], np.dtype[np.float64]], 
+           np.ndarray[tuple[int], np.dtype[np.float64]], 
+           np.ndarray[tuple[int], np.dtype[np.float64]], 
+           np.ndarray[tuple[int], np.dtype[np.float64]], 
+           str
+        ]:
+    """
+    Samples pre and post traces based on the specified method and returns interpolated coordinates and displacements.
+
+    Args:
+        pre_trace (Trace): Trace object containing coordinate data for the pre-bend trace.
+        post_trace (Trace): Trace object containing coordinate data for the post-bend trace.
+        sample_method (str): Method to use for sampling. Must be either "arc_length" or "projected_x".
+        n_samples (int): Number of samples to take along the specified method (number of coordinates to interpolate).
+
+    Returns:
+        A tuple containing:
+            - sample_coord: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of sampled coordinates (arclength or projected x) at which the traces were interpolated.
+            - x_pre: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of interpolated x-coordinates of the pre-bend trace at the sampled coordinates.
+            - y_pre: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of interpolated y-coordinates of the pre-bend trace at the sampled coordinates.
+            - x_post: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of interpolated x-coordinates of the post-bend trace at the sampled coordinates.
+            - y_post: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of interpolated y-coordinates of the post-bend trace at the sampled coordinates.
+            - deflection: np.ndarray[tuple[int], np.dtype[np.float64]], 1D array of signed post-pre displacements along the local normal of the pre trace.
+            - xlabel: str, label for the x-axis of the displacement plot, either "s (um)" for arclength sampling or "X (um)" for projected x sampling.
+    """
+
+    if sample_method == "arc_length":
+        s_pre = get_cumulative_distance_array(pre_trace["X"], pre_trace["Y"])
+        s_post = get_cumulative_distance_array(post_trace["X"], post_trace["Y"])
+
+        sample_min = 0 # sample_min = max(s_pre.min(), s_post.min())
+        # get practical max of trace arclength
+        sample_max = min(s_pre[-1], s_post[-1]) # sample_max = min(s_pre.max(), s_post.max())
+        if sample_max <= sample_min:
+            raise ValueError("Error: Selected arclength range is invalid. There is likely an issue with GUI clicked points.")
+        sample_coord = build_interpolated_sample_coord(sample_min, sample_max, n_samples)
+
+        x_pre, y_pre = sample_trace_by_arclength(pre_trace, sample_coord)
+        x_post, y_post = sample_trace_by_arclength(post_trace, sample_coord)
+        deflection = calculate_normal_displacement(sample_coord, x_pre, y_pre, x_post, y_post)
+        xlabel = "s (um)"
+    elif sample_method == "projected_x":
+        sample_min = max(pre_trace["X"].min(), post_trace["X"].min()) # can't just hardcode 0 like with arc_length method since these are actual coordinates (post trace start could be below or above pre trace start)
+        sample_max = min(pre_trace["X"][-1], post_trace["X"][-1]) # min(pre_trace["X"].max(), post_trace["X"].max())
+        if sample_max <= sample_min:
+            raise ValueError("Error: Selected coordinate range is invalid. There is likely an issue with GUI clicked points.")
+        sample_coord = build_interpolated_sample_coord(sample_min, sample_max, n_samples)
+
+        x_pre, y_pre = sample_trace_by_projected_x(pre_trace, sample_coord)
+        x_post, y_post = sample_trace_by_projected_x(post_trace, sample_coord)
+        deflection = calculate_normal_displacement(sample_coord, x_pre, y_pre, x_post, y_post)
+        xlabel = "X (um)"
+    else:
+        raise ValueError("SAMPLE_METHOD must be 'arc_length' or 'projected_x'")
+
+    return sample_coord, x_pre, y_pre, x_post, y_post, deflection, xlabel
+
+# ==============================================================================
+# endregion
+# ==============================================================================
+
+
+# ==============================================================================
+# region - Load Data Files
+# ==============================================================================
+
+# ---- load data ------------------------------------------------------
+file_path_pre = "../00-AFM_Images/" + PRE_FILE_NAME + ".ibw"
+file_path_post = "../00-AFM_Images/" + POST_FILE_NAME + ".ibw"
+Stack = "errorstack"
+data_pre = LD.JupiterAFM_loadData_toDict(file_path_pre, Stack)
+data_post = LD.JupiterAFM_loadData_toDict(file_path_post, Stack)
+data_labels = data_post['labels']
+print("data_labels:", data_labels)
+
+print(f"\nPre image: {file_path_pre}")
+print(f"Post image: {file_path_post}")
+ask_to_continue()
+
+sample_method = prompt_sample_method(SAMPLE_METHOD)
+ask_to_continue()
+n_samples = prompt_n_samples(N_SAMPLES)
+ask_to_continue()
+
+pre_trace_raw = load_coord_trace(PRE_FILE_NAME, PRE_FILE_TIME)
+post_trace_raw = load_coord_trace(POST_FILE_NAME, POST_FILE_TIME)
+print("pre coord file:", pre_trace_raw["coord_file"])
+print("post coord file:", post_trace_raw["coord_file"])
+
+registration_suffix = f"{PRE_FILE_NAME}_{POST_FILE_NAME}"
+transformed_suffix = f"{PRE_FILE_NAME}_{PRE_FILE_TIME}_{POST_FILE_NAME}_{POST_FILE_TIME}"
+
+if stored_registration_files_exist(registration_suffix, transformed_suffix):
+    default_registration_mode = "reuse"
+elif stored_registration_points_exist(registration_suffix):
+    default_registration_mode = "retransform"
+else:
+    default_registration_mode = "new"
+
+registration_mode = prompt_registration_mode(default_registration_mode)
+ask_to_continue()
+combined_overlay_path = pathlib.Path("results_images") / f"combined_{PRE_FILE_NAME}_{POST_FILE_NAME}.png"
+
+if registration_mode == "reuse":
+    pre_trace, post_trace, registration_rmse = load_existing_registration_analysis(
+        registration_suffix,
+        transformed_suffix,
+    )
+    print("\nSuccess: loaded stored transformed trace coordinates.")
+    print("Proceeding directly to analysis with the saved transformation.\n")
+    plot_registration_overlay(
+        data_pre,
+        data_post,
+        pre_trace,
+        post_trace,
+        registration_rmse,
+        combined_overlay_path,
+        show_overlay=False,
+    )
+    ask_to_continue()
+else:
+    print("\nProceeding to analysis-axis orientation.")
+    should_swap_xy = prompt_swap_xy(SWAP_XY)
+    ask_to_continue()
+    if registration_mode == "retransform":
+        rotation, translation, registration_rmse = load_existing_registration_transform(registration_suffix)
+        print("\nSuccess: loaded stored registration points.")
+        print("Proceeding to create transformed trace coordinates using the current x_split.\n")
+        ask_to_continue()
+    else:
+        rotation, translation, registration_rmse = register_pre_to_post(
+            data_pre,
+            data_post,
+            registration_suffix,
+        )
+
+    pre_trace = rebuild_trace_after_registration(pre_trace_raw, rotation, translation, should_swap_xy)
+    post_trace = rebuild_trace_after_registration(post_trace_raw, None, None, should_swap_xy)
+    print(f"\nProceeding to trace-alignment refinement before x_split = {x_split:.4g}.")
+    pre_trace, trace_alignment_rmse = refine_pre_trace_alignment_before_x_split(
+        pre_trace,
+        post_trace,
+        sample_method,
+        x_split,
+        n_samples,
+        should_swap_xy,
+    )
+    registration_rmse = trace_alignment_rmse
+
+    save_transformed_trace_coordinates(pre_trace, post_trace, transformed_suffix)
+    plot_registration_overlay(
+        data_pre,
+        data_post,
+        pre_trace,
+        post_trace,
+        registration_rmse,
+        combined_overlay_path,
+    )
+
+# Use one shared origin after registration so post - pre displacements are preserved.
+x0 = pre_trace["X"].min()
+y0 = pre_trace["Y"].min()
+set_origin(pre_trace, x0, y0)
+set_origin(post_trace, x0, y0)
+
+# ==============================================================================
+# endregion
+# ==============================================================================
+
+
+# ==============================================================================
+# region - Work with Data
+# ==============================================================================
+
+sample_coord, x_pre, y_pre, x_post, y_post, deflection_data, coord_xlabel = sample_traces(
+                                                                                            pre_trace, 
+                                                                                            post_trace, 
+                                                                                            sample_method, 
+                                                                                            n_samples
+                                                                                            )
+deflection_magnitude = np.abs(deflection_data)
+
+# show scatter plot of deflection data
+plt.scatter(sample_coord, deflection_magnitude, color = 'black', label = '|Normal Deflection Data|')
+plt.legend()
+plt.title(f"|Normal Deflection Data|: {POST_FILE_NAME} - {PRE_FILE_NAME}")
+plt.xlabel(coord_xlabel)
+plt.ylabel("d (um)")
+plt.show()
+
+np.savetxt(f"results/displacement_before_after.txt", 
+           np.column_stack([sample_coord, x_pre, y_pre, x_post, y_post, deflection_data]), 
+           header=f"{coord_xlabel.replace(' ', '_')} X_pre Y_pre X_post Y_post D_normal", 
+           comments="", 
+           fmt="%.10f")
+
+mask_d = sample_coord > x_split
+fit_plot_mask = sample_coord >= x_split
+fit_x_min = sample_coord[mask_d].min()
+fit_x_max = sample_coord[mask_d].max()
+fit_x_span = fit_x_max - fit_x_min
+x_fit_local = sample_coord[mask_d] - fit_x_min
+
+expected_L = np.sqrt(fit_x_span**2 + deflection_magnitude[mask_d].max()**2)
+L_lower = 0.8 * expected_L
+L_upper = 1.5 * expected_L
+L_initial = expected_L
+d0_initial = deflection_magnitude[mask_d].max()
+d_opt, d_cov = curve_fit(
+                        deflection_bent_ribbon_local, 
+                        x_fit_local, 
+                        deflection_magnitude[mask_d], 
+                        p0=[d0_initial, L_initial], 
+                        bounds=([0, L_lower], [np.inf, L_upper]),
+                        maxfev=10000
+                        )
+derr = np.sqrt(np.diag(d_cov))
+x_local = np.clip(sample_coord - fit_x_min, 0, None)
+fit_data = deflection_bent_ribbon_local(x_local, *d_opt)
+
+print(f"Fit Results normal deflection: d(x) = d0*(x/L-1)^3")
+print(f"dopt [d0, L] = {d_opt}")
+print(f"d0: {d_opt[0]:.4e} ± {derr[0]:.4e}")
+print(f"L: {d_opt[1]:.4e} ± {derr[1]:.4e}")
+print(f"L constrained to [{L_lower:.4e}, {L_upper:.4e}] to keep L within the fitted bending region.")
+print(f"Fit uses local bending coordinate x_local = {coord_xlabel} - {fit_x_min:.4e} um.")
+print("Local fit evaluates the original formula at x_model = x_local + L.")
+if np.isclose(d_opt[1], L_upper):
+    print("Note: fitted L is at the upper bound. If the fit still looks poor, adjust x_split or revisit whether this trace matches the model.")
+print(f"Fit-data mean residual over masked region: {np.mean(fit_data[mask_d] - deflection_magnitude[mask_d]):.4e} um")
+
+textstr = '\n'.join([f'$d(x)=d_0(x/L-1)^3$',
+    f'$d_0$ = {d_opt[0]:.2e} ± {derr[0]:.2e}',
+    f'$L$ = {d_opt[1]:.2e} ± {derr[1]:.2e}',
+])
+
+# ---- local twist angle  ------------------------------------------------------
+mask_twist = sample_coord > x_split
+d_deriv = derivative_deflection_bent_ribbon_local(x_local[mask_twist], *d_opt)
+theta = np.arctan(np.abs(d_deriv)) * 180 / np.pi
+
+save_direct_fitvars(
+    PRE_FILE_NAME,
+    PRE_FILE_TIME,
+    POST_FILE_NAME,
+    POST_FILE_TIME,
+    sample_method,
+    n_samples,
+    registration_rmse,
+    x_split,
+    d_opt,
+    derr,
+    sample_coord,
+    deflection_data,
+    deflection_magnitude,
+    fit_data,
+    sample_coord[mask_twist],
+    theta,
+)
+
+# Combine into 1 figure
+fig, ax= plt.subplots(1, 4, figsize=(18, 9))
+
+# Ax 1: pre-bend raw AFM data and clicked coordinates
+PD.JupiterAFM_plotData_imshow(data_pre, data_labels[1], ax = ax[0], cmap_corr = 0.7, cmap = 'gray')
+ax[0].scatter(pre_trace_raw["Xt"],pre_trace_raw["Yt"],s=0.1, color='tab:blue')
+ax[0].set_title('pre-bend data')
+ax[0].axis('off')
+
+# Ax 2: post-bend raw AFM data and clicked coordinates
+PD.JupiterAFM_plotData_imshow(data_post, data_labels[1], ax = ax[1], cmap_corr = 0.7, cmap = 'gray')
+ax[1].scatter(post_trace_raw["Xt"], post_trace_raw["Yt"], s = 0.1, color = 'r')
+ax[1].set_title('post-bend data')
+ax[1].axis('off')
+
+# Ax 3: normal deflection from post-bend minus pre-bend traces
+ax[2].scatter(sample_coord, deflection_magnitude, color = 'black', label = 'matched data')
+ax[2].scatter(sample_coord[mask_d], deflection_magnitude[mask_d], color = 'tab:blue', label = 'fit data')
+ax[2].plot(sample_coord[fit_plot_mask], fit_data[fit_plot_mask],
+           '--', c='crimson', label='Fit')
+ax[2].set_title('|normal displacement: postBend - preBend|')
+ax[2].set_xlabel(coord_xlabel)
+ax[2].set_ylabel("d (um)")
+props = dict(boxstyle='round', facecolor='gray', alpha=0.2)
+ax[2].text(0.05, 0.98, textstr,
+        transform=ax[2].transAxes,
+        fontsize=10,
+        verticalalignment='top',
+        bbox=props)
+ax[2].legend(loc='upper right')
+
+# Ax 4: local angle
+ax[3].scatter(sample_coord[mask_twist], theta, color='black')
+ax[3].set_title('local twist-angle')
+ax[3].set_xlabel(coord_xlabel)
+ax[3].set_ylabel(f"$ \\Delta \\theta$  (degree)")
+
+plt.tight_layout()
+plt.savefig(f"results_images/{POST_FILE_NAME}_minus_{PRE_FILE_NAME}.png")
+plt.show()
+
+# ==============================================================================
+# endregion
+# ==============================================================================

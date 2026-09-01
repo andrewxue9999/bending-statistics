@@ -39,7 +39,7 @@ class AFM_Digitizer:
         
         # Setup Figure
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
-        plt.subplots_adjust(bottom=0.2)
+        plt.subplots_adjust(bottom=0.2, top=0.9)
         
         # Contrast Clipping (1st and 99th percentile)
         vmin, vmax = np.percentile(self.data[~np.isnan(self.data)], [1, 99])
@@ -52,19 +52,35 @@ class AFM_Digitizer:
                                  aspect='equal')
         
         plt.colorbar(self.im, ax=self.ax, label="Height (m)")
-        self.ax.set_xlabel("X ($\mu m$)")
-        self.ax.set_ylabel("Y ($\mu m$)")
+        self.ax.set_xlabel(r"X ($\mu m$)")
+        self.ax.set_ylabel(r"Y ($\mu m$)")
         
         # 1. Re-enable Clicker
         self.klicker = clicker(self.ax, ["edge"], markers=["x"], colors=["red"])
+        self.counter_text = self.fig.text(
+            0.98, 0.96, "Points: 0",
+            transform=self.fig.transFigure,
+            ha="right",
+            va="top",
+            color="white",
+            fontsize=12,
+            bbox=dict(boxstyle="round", facecolor="black", alpha=0.55)
+        )
         
         # 2. RE-ENABLE SCROLL ZOOM
         self.fig.canvas.mpl_connect('scroll_event', self.handle_zoom)
+        self.fig.canvas.mpl_connect('button_release_event', self.update_point_counter)
+        self.fig.canvas.mpl_connect('key_release_event', self.update_point_counter)
         
         # Save Button
         self.btn_ax = plt.axes([0.7, 0.05, 0.15, 0.075])
         self.btn = Button(self.btn_ax, 'Save & Exit', color='honeydew')
         self.btn.on_clicked(self.close_app)
+
+    def update_point_counter(self, event=None):
+        pts = self.klicker.get_positions()['edge']
+        self.counter_text.set_text(f"Points: {len(pts)}")
+        self.fig.canvas.draw_idle()
 
     def handle_zoom(self, event):
         """ Standard zoom logic integrated into the class. """
@@ -109,5 +125,7 @@ class AFM_Digitizer:
 if __name__ == "__main__":
     # Ensure correct params
     # app = AFM_Digitizer('../../Data/Image0005.ibw', 'Trevor_WSe2_tgr3')
-    app = AFM_Digitizer("../00-AFM_Images/BBGcg0_tap_0011.ibw", "errorstack")
+    # app = AFM_Digitizer("../00-AFM_Images/bBLG_WSe2_push0000.ibw", "errorstack")
+    app = AFM_Digitizer("../00-AFM_Images/MBLG21_duringPush0007.ibw", "errorstack")
+    
     plt.show(block=True)

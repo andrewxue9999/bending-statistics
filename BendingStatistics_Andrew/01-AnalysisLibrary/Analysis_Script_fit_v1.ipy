@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Apr 10 14:50:26 2026
+
+@author: carolingold
+
+- inspired and based on legacy code by Bjarke S. Jessen and M. Kapfer
+"""
+
+from typing import Final
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+%matplotlib qt
+from scipy.optimize import curve_fit
+from functools import partial
+import csv
+
+# ---- import own library ------------------------------------------------------
+import os
+import pathlib
+import sys
+libpath=os.path.join(pathlib.Path(__file__).parents[3], '00-Library/') 
+print(libpath)
+sys.path.insert(1,libpath)
+import Asylum_LoadData_v3 as LD
+import Asylum_plotData_v2 as PD
+
+# ==============================================================================
+# Load Data Files
+# ==============================================================================
+
+# ---- Load specific coordinate file -------------------------------------------
+FILE_NAME: Final[str] = "MBLG_cg26_Push2_0004"
+COORD_FILE_TIME: Final[str] = "154852"
+
+SHOW_INTERMEDIATE_GRAPHS: Final[bool] = False
+
+# coord_file = "results/coords_Image0005_155649.txt" # !!! CHANGE TO LATEST FILE
+# coord_file = "results/coords_BBGcg0_tap_0011_223541.txt" # !!! CHANGE TO LATEST FILE
+coord_file = "results/coords_" + FILE_NAME + "_" + COORD_FILE_TIME + ".txt" # !!! CHANGE TO LATEST FILE
+coord_data = np.loadtxt(coord_file)
+Xt, Yt = coord_data[:, 0], coord_data[:, 1]
+# X=Xt-Xt.min()
+# Y=Yt-Yt.min()
+X = Yt - Yt.min()
+Y = Xt - Xt.min()
+x_split: Final[int] = 36 # CHANGE FOR LATEST FILE -> split point where ribbon begins visibly bending
+
+# ---- load data ------------------------------------------------------
+# filename_bend='../../Data/Image0005.ibw'
+# Stack = 'Trevor_WSe2_tgr3'
+# filename_bend='../00-AFM_Images/BBGcg0_tap_0011.ibw' # !!! CHANGE TO LATEST FILE
+# filename_bend='../00-AFM_Images/bBLG_WSe2_push0011.ibw' # !!! CHANGE TO LATEST FILE
+filename_bend = "../00-AFM_Images/" + FILE_NAME + ".ibw"
+Stack = "errorstack"
+data_bent = LD.JupiterAFM_loadData_toDict(filename_bend, Stack)
+# print(data_unbent)
+data_labels = data_bent["labels"]
+print("data_labels:", data_labels)
+
+# ==============================================================================
+# Define Functions
+# ==============================================================================
+
+def parabola(x, a, b, c):
+    return a*x**2 + b*x + c
+
+def line(x, m, q):
+    return m*x + q
+
+def deflection_bent_ribbon(x, d0, L):
+    return d0/(L**3)*(x-L)**3
+
+def deflection_bent_ribbon_abs(x, d0, L):
+    return np.abs(deflection_bent_ribbon(x, d0, L))
+
+def deflection_bent_ribbon_local(x_local, d0, L):
+    return deflection_bent_ribbon_abs(x_local + L, d0, L)
+
+def derivative_deflection_bent_ribbon_local(x_local, d0, L):
+    return derivative_deflection_bent_ribbon(x_local + L, d0, L)
+
+def derivative_deflection_bent_ribbon(x, d0, L):
+    return d0/(L**3)*3*(x-L)**2
+
+FITVAR_COLUMNS = [
+    "x_split",
+    "fit_v1_file_name", "fit_v1_file_time",
+    "fit_v1_parabola_a", "fit_v1_parabola_b", "fit_v1_parabola_c",
+    "fit_v1_parabola_a_err", "fit_v1_parabola_b_err", "fit_v1_parabola_c_err",
+    "fit_v1_line_m", "fit_v1_line_q", "fit_v1_line_m_err", "fit_v1_line_q_err",
+    "fit_v1_d0", "fit_v1_L", "fit_v1_d0_err", "fit_v1_L_err",
+    "fit_v1_x", "fit_v1_d_signed", "fit_v1_d_abs", "fit_v1_d_fit",
+    "fit_v1_theta_x", "fit_v1_theta",
+    "|",
+    "direct_pre_file_name", "direct_pre_file_time",
+    "direct_post_file_name", "direct_post_file_time",
+    "direct_sample_method", "direct_n_samples",
+    "direct_registration_rmse", "direct_d0", "direct_L", "direct_d0_err", "direct_L_err",
+    "direct_x", "direct_d_signed", "direct_d_abs", "direct_d_fit",
+    "direct_theta_x", "direct_theta",
+]
+
+def format_fitvar_value(value):
+    if value == "|":
+        return "|"
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "nan"
+    try:
+        if np.isnan(value):
+            return "nan"
+    except TypeError:
+        pass
+    return f"{float(value):.10g}"
+
+def read_fitvar_rows(path):
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+def write_fitvar_rows(path, rows):
+    path.parent.mkdir(exist_ok=True)
+    normalized_rows = []
+    for row in rows:
+        normalized_rows.append({column: row.get(column, "nan") for column in FITVAR_COLUMNS})
+        normalized_rows[-1]["|"] = "|"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FITVAR_COLUMNS, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        for row in normalized_rows:
+            writer.writerow({column: format_fitvar_value(row[column]) for column in FITVAR_COLUMNS})
+
+def save_fit_v1_fitvars(
+    file_name,
+    file_time,
+    x_split,
+    p_opt,
+    perr,
+    l_opt,
+    lerr,
+    d_opt,
+    derr,
+    X,
+    deflection_data,
+    deflection_magnitude,
+    d_fit,
+    theta_x,
+    theta
+):
+    output_path = pathlib.Path("results") / f"fitvar_{file_name}_{file_time}.txt"
+    existing_rows = read_fitvar_rows(output_path)
+    row_count = max(len(X), len(theta), len(existing_rows), 1)
+    rows = []
+    for idx in range(row_count):
+        row = existing_rows[idx] if idx < len(existing_rows) else {}
+        row.update({
+            "x_split": x_split,
+            "fit_v1_file_name": file_name,
+            "fit_v1_file_time": file_time,
+            "fit_v1_parabola_a": p_opt[0],
+            "fit_v1_parabola_b": p_opt[1],
+            "fit_v1_parabola_c": p_opt[2],
+            "fit_v1_parabola_a_err": perr[0],
+            "fit_v1_parabola_b_err": perr[1],
+            "fit_v1_parabola_c_err": perr[2],
+            "fit_v1_line_m": l_opt[0],
+            "fit_v1_line_q": l_opt[1],
+            "fit_v1_line_m_err": lerr[0],
+            "fit_v1_line_q_err": lerr[1],
+            "fit_v1_d0": d_opt[0],
+            "fit_v1_L": d_opt[1],
+            "fit_v1_d0_err": derr[0],
+            "fit_v1_L_err": derr[1],
+            "fit_v1_x": X[idx] if idx < len(X) else np.nan,
+            "fit_v1_d_signed": deflection_data[idx] if idx < len(deflection_data) else np.nan,
+            "fit_v1_d_abs": deflection_magnitude[idx] if idx < len(deflection_magnitude) else np.nan,
+            "fit_v1_d_fit": d_fit[idx] if idx < len(d_fit) else np.nan,
+            "fit_v1_theta_x": theta_x[idx] if idx < len(theta_x) else np.nan,
+            "fit_v1_theta": theta[idx] if idx < len(theta) else np.nan,
+        })
+        rows.append(row)
+    write_fitvar_rows(output_path, rows)
+    print(f"Saved fit variables to {output_path}")
+
+# ==============================================================================
+# Work with Data
+# ==============================================================================
+
+# ---- plot data & coordinates -------------------------------------------------
+if SHOW_INTERMEDIATE_GRAPHS:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    PD.JupiterAFM_plotData_imshow(data_bent, data_labels[1],ax=ax,cmap_corr=0.7,cmap='gray')#,snap=True)#, axis, title=True,**plotargs)
+    ax.scatter(Xt,Yt,s=0.1, color='r')
+    plt.show()
+
+# ---- fit cooordinates  ------------------------------------------------------
+# (4D) Curve fitting with Uncertainty
+# Parabolic Fit
+p_opt, p_cov = curve_fit(parabola, X, Y)
+# p_cov is the covariance matrix. Sqrt of diagonal = standard deviation.
+perr = np.sqrt(np.diag(p_cov))
+
+print(f"Fit Results:")
+#print(f'p_cov={p_cov}')
+print(f"Parabola 'a' (a*x^2 + b*x + c): {p_opt[0]:.4e} ± {perr[0]:.4e} (p_opt[0] ± perr[0])")
+
+# Linear Fit (using mask Y > 25)
+# mask = X < 10 # !!! CHANGE THIS
+mask = X < x_split
+
+l_opt, l_cov = curve_fit(line, X[mask], Y[mask])
+lerr = np.sqrt(np.diag(l_cov))
+
+# Visualization
+if SHOW_INTERMEDIATE_GRAPHS:
+    x_grid = np.linspace(X.min(), X.max(), 100)
+
+    plt.figure(figsize=(8, 5))
+    plt.scatter(X, Y, color='black', label='Data')
+    plt.scatter(X[mask], Y[mask], color='tab:blue', label='Data (used for linear unbent fit)')
+    plt.plot(x_grid, parabola(x_grid, *p_opt), '-', color='orange', label='Parabolic Fit')
+    plt.plot(x_grid, line(x_grid, *l_opt), '--', color='crimson',label='Linear Reference')
+    plt.legend()
+    plt.xlabel("X (um)")
+    plt.ylabel("Y (um)")
+    plt.show()
+
+
+'''
+# Calculate d and propagate error
+x_max = np.max(X)
+val_line = line(x_max, *l_opt)
+val_para = parabola(x_max, *p_opt)
+d = val_line - val_para
+print(f"Displacement d: {d:.4f} um")
+'''
+
+# ---- deflection  ------------------------------------------------------
+deflection_data = Y - line(X, *l_opt)
+deflection_magnitude = np.abs(deflection_data)
+
+np.savetxt(f"results/displacement.txt", np.column_stack([X, deflection_data]),
+               header="X D", comments="", fmt="%.10f")
+
+# Fit
+#deflection_bent = deflection_bent_ribbon # partial(deflection_bent_ribbon, L=31.2)
+# mask_d= X >10
+mask_d = X > x_split
+fit_x_min = X[mask_d].min()
+fit_x_max = X[mask_d].max()
+fit_x_span = fit_x_max - fit_x_min
+x_fit_local = X[mask_d] - fit_x_min
+
+expected_L = np.sqrt(fit_x_span**2 + deflection_magnitude[mask_d].max()**2)
+
+# L_lower = 0.5 * fit_x_span # fit_x_min
+# L_upper = 1.5 * fit_x_span # fit_x_max
+L_lower = 0.8 * expected_L
+L_upper = 1.5 * expected_L
+# L_initial = fit_x_span # fit_x_min + 0.25 * fit_x_span
+L_initial = expected_L
+d0_initial = deflection_magnitude[mask_d].max()
+
+d_opt, d_cov = curve_fit(
+    deflection_bent_ribbon_local,
+    x_fit_local,
+    deflection_magnitude[mask_d],
+    p0=[d0_initial, L_initial],
+    bounds=([0, L_lower], [np.inf, L_upper]),
+    maxfev=10000
+)
+# derr=np.sqrt(np.diag(p_cov)) # NOTE: change p_cov to d_cov? d_cov is covariance from the deflection fit. 
+derr = np.sqrt(np.diag(d_cov))
+
+print(f"Fit Results for displacement model d(x):")
+print(f"dopt [d0, L] = {d_opt}")
+print(f"d0: {d_opt[0]:.4e} ± {derr[0]:.4e}")
+print(f"L: {d_opt[1]:.4e} ± {derr[1]:.4e}")
+print(f"L constrained to [{L_lower:.4e}, {L_upper:.4e}] to keep L within the fitted bending region.")
+print(f"Fit uses local bending coordinate x_local = X - {fit_x_min:.4e} um.")
+print("Local fit evaluates the original formula at x_model = x_local + L.")
+if np.isclose(d_opt[1], L_upper):
+    print("Note: fitted L is at the upper bound. If the fit still looks poor, adjust x_split or revisit whether this trace matches the model.")
+
+# After your curve_fit, build a text string with your parameters
+textstr = '\n'.join([f'$d(x)=d_0(x/L-1)^3$',
+    f'$d_0$ = {d_opt[0]:.2e} ± {derr[0]:.2e}',
+    f'$L$ = {d_opt[1]:.2e} ± {derr[1]:.2e}',
+])
+
+if SHOW_INTERMEDIATE_GRAPHS:
+    x_grid = np.linspace(X.min(), X.max(), 100)
+    x_grid_local = np.clip(x_grid - fit_x_min, 0, None)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    plt.scatter(X, deflection_magnitude, color='black', label='Data (masked)')#, label='Snapped Data')
+    plt.scatter(X[mask_d], deflection_magnitude[mask_d], color='tab:blue', label='Data (used for displacement fit)')#, label='Snapped Data')
+    #plt.plot(x_grid, parabola(x_grid, *p_opt), '-', color='orange', label='Parabolic Fit')
+    #plt.plot(x_grid, line(x_grid, *l_opt), '--', color='crimson',label='Linear Reference')
+    plt.plot(x_grid, deflection_bent_ribbon_local(x_grid_local, *d_opt), label='Displacement Fit')
+    # Add a text box to the plot
+    props = dict(boxstyle='round', facecolor='gray', alpha=0.2)
+    ax.text(0.05, 0.95, textstr,
+            transform=ax.transAxes,   # coordinates relative to axes (0-1)
+            fontsize=10,
+            verticalalignment='top',
+            bbox=props)
+
+    plt.legend()
+    plt.title('|Data - linear reference|')
+    plt.xlabel("X (um)")
+    plt.ylabel("d (um)")
+    plt.show()
+
+# ---- local twist angle  ------------------------------------------------------
+mask_twist = X > x_split
+
+x_local = np.clip(X - fit_x_min, 0, None)
+d_deriv = derivative_deflection_bent_ribbon_local(x_local[mask_twist], *d_opt)
+theta = np.arctan(np.abs(d_deriv)) * 180 / np.pi
+d_fit = deflection_bent_ribbon_local(x_local, *d_opt)
+
+save_fit_v1_fitvars(
+    FILE_NAME,
+    COORD_FILE_TIME,
+    x_split,
+    p_opt,
+    perr,
+    l_opt,
+    lerr,
+    d_opt,
+    derr,
+    X,
+    deflection_data,
+    deflection_magnitude,
+    d_fit,
+    X[mask_twist],
+    theta,
+)
+
+if SHOW_INTERMEDIATE_GRAPHS:
+    fig, ax=plt.subplots(figsize=(8, 5))
+    plt.scatter(X[mask_twist], theta, color='black')#, label='Snapped Data')
+
+    # plt.legend()
+    plt.title('local twist-angle')
+    plt.xlabel("X (um)")
+    plt.ylabel(f"$ \\Delta \\theta$  (degree)")
+    plt.show()
+
+'''
+#fit linear fit to deflection plot
+deflection=np.abs(Y-line(X, *l_opt))
+# Linear Fit (using mask Y > 25)
+dmask = X > 22
+l_opt_d, l_cov_d = curve_fit(line, X[dmask], deflection[dmask])
+lerr_d = np.sqrt(np.diag(l_cov_d))
+print(f'slope: {l_cov_d[0][0]}')
+print(f'arctan: {np.arctan(l_cov_d[0]*1e6)*180./np.pi}')
+
+plt.figure(figsize=(8, 5))
+plt.scatter(X, deflection, color='black')#, label='Snapped Data')
+plt.scatter(X[dmask],deflection[dmask],color='tab:blue')
+plt.plot(x_grid, line(x_grid, *l_opt_d), '--', color='crimson',label='Linear Reference')
+#plt.plot(x_grid, line(x_grid, *l_opt), '--', color='crimson',label='Linear Reference')
+#plt.legend()
+plt.title('|Data - linear reference|')
+plt.xlabel("X (um)")
+plt.ylabel("d (um)")
+plt.show()
+'''
+
+# Combine into 1 figure
+
+x_grid = np.linspace(X.min(), X.max(), 100)
+x_grid_local = np.clip(x_grid - fit_x_min, 0, None)
+fig, ax= plt.subplots(1, 4, figsize=(18,9))
+
+#Ax 1: Raw data (AFM()
+PD.JupiterAFM_plotData_imshow(data_bent, data_labels[1],ax=ax[0],cmap_corr=0.7,cmap='gray')#,snap=True)#, axis, title=True,**plotargs)
+ax[0].scatter(Xt,Yt,s=0.1, color='r')
+ax[0].axis('off')
+
+#Ax2: Edge data & fits
+ax[1].scatter(X, Y, color='black', label='Data')
+ax[1].scatter(X[mask], Y[mask], color='tab:blue', label='Data (used for linear unbent fit)')
+ax[1].plot(x_grid, parabola(x_grid, *p_opt), '-', color='orange', label='Parabolic Fit')
+ax[1].plot(x_grid, line(x_grid, *l_opt), '--', color='crimson',label='Linear Reference')
+ax[1].legend()
+ax[1].set_xlabel("X (um)")
+ax[1].set_ylabel("Y (um)")
+ax[1].set_title('Data along edge')
+
+#ax3: displacement
+ax[2].scatter(X, deflection_magnitude, color='black', label='Data (masked)')#, label='Snapped Data')
+ax[2].scatter(X[mask_d], deflection_magnitude[mask_d], color='tab:blue', label='Data (used for displacement fit)')#, label='Snapped Data')
+ax[2].plot(x_grid, deflection_bent_ribbon_local(x_grid_local, *d_opt), '--', c='crimson', label='Displacement Fit')
+ax[2].set_title('|Data - linear reference|')
+ax[2].set_xlabel("X (um)")
+ax[2].set_ylabel("d (um)")
+
+# store legend in variable to later use for positioning textstr text box
+leg = ax[2].legend(loc='upper right')
+fig.canvas.draw() # Draw the canvas to get the legend's layout geometries before generating final image
+bbox = leg.get_window_extent()
+bbox_axes = ax[2].transAxes.inverted().transform_bbox(bbox)
+text_y = bbox_axes.y0 - 0.01 # prepare to position text box just below legend by 0.01
+
+# Add a text box to the plot
+props = dict(boxstyle='round', facecolor='gray', alpha=0.2)
+ax[2].text(0.98, text_y, textstr,
+        transform=ax[2].transAxes,   # coordinates relative to axes (0-1)
+        fontsize=10,
+        horizontalalignment='right',
+        verticalalignment='top',
+        bbox=props
+        )
+
+#ax4: local angle
+ax[3].scatter(X[mask_twist], theta, color='black')#, label='Snapped Data')
+ax[3].set_title('local twist-angle')
+ax[3].set_xlabel("X (um)")
+ax[3].set_ylabel(f"$ \\Delta \\theta$  (degree)")
+
+
+# plt.savefig(f"Image05_lowerEdge.png") # CHANGE THIS NAME
+plt.savefig(f"results_images/{FILE_NAME}.png")
+plt.tight_layout()

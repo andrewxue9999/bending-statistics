@@ -1,0 +1,262 @@
+# %%
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Plots bend-fit displacement data from one or more post/after trace fitvar files.
+
+Use this after running Analysis_Script_fit_v1.py and/or
+Analysis_Script_direct_compare.ipy so that results/fitvar_FILENAME_FILETIME.txt
+files exist.
+"""
+
+import csv
+import pathlib
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+%matplotlib qt
+
+RESULTS_DIR = pathlib.Path("results")
+RESULTS_IMAGES_DIR = pathlib.Path("results_images")
+RESULTS_IMAGES_DIR.mkdir(exist_ok=True)
+RIBBON_WIDTH_PATHS = [
+    pathlib.Path("ribbon_width_values_um.txt"),
+    pathlib.Path("ribbon_width_values_um"),
+]
+
+def to_float(value):
+    """
+    Convert a value to float and return NaN if conversion is not possible.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+def read_fitvar_file(path):
+    """
+    Read one tab-delimited fitvar file into a list of row dictionaries.
+    """
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    return rows
+
+def read_ribbon_widths():
+    """
+    Read ribbon widths keyed by image file name from the local width table.
+    """
+    width_path = next((path for path in RIBBON_WIDTH_PATHS if path.exists()), None)
+    if width_path is None:
+        raise FileNotFoundError(
+            "Could not find ribbon_width_values_um.txt or ribbon_width_values_um."
+        )
+
+    widths = {}
+    with width_path.open() as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if stripped == "" or stripped.startswith("#"):
+                continue
+            if ":" in stripped:
+                file_name, width_text = stripped.split(":", 1)
+            else:
+                parts = stripped.split()
+                if len(parts) < 2:
+                    raise ValueError(f"Could not parse line {line_number} in {width_path}: {stripped}")
+                file_name, width_text = parts[0], parts[1]
+            widths[file_name.strip()] = float(width_text.strip())
+    return widths
+
+def numeric_column(rows, column_name):
+    """
+    Extract one numeric column from fitvar rows as a float array.
+    """
+    return np.asarray([to_float(row.get(column_name)) for row in rows], dtype=float)
+
+def valid_xy(x, y):
+    """
+    Drop paired x/y samples where either value is not finite.
+    """
+    mask = np.isfinite(x) & np.isfinite(y)
+    return x[mask], y[mask]
+
+def list_available_fitvar_files():
+    """
+    Return all saved fitvar result files in sorted order.
+    """
+    return sorted(RESULTS_DIR.glob("fitvar_*.txt"))
+
+def prompt_fitvar_files(available_files):
+    """
+    Prompt the user to select one or more listed fitvar files by number.
+    """
+    print("Available post/after trace fitvar files:")
+    for idx, path in enumerate(available_files, start=1):
+        print(f"  {idx}: {path.name}")
+
+    print("\nEnter one or more numbers for post/after trace files, separated by spaces.")
+    print("Example: 1 2 6")
+    user_input = input("Selected fitvar file number(s): ").strip()
+
+    while True:
+        selected_indices = []
+        invalid_tokens = []
+        for token in user_input.split():
+            try:
+                selected_idx = int(token)
+            except ValueError:
+                invalid_tokens.append(token)
+                continue
+
+            if 1 <= selected_idx <= len(available_files):
+                selected_indices.append(selected_idx)
+            else:
+                invalid_tokens.append(token)
+
+        selected_indices = list(dict.fromkeys(selected_indices))
+        if len(selected_indices) > 0 and len(invalid_tokens) == 0:
+            return [available_files[selected_idx - 1] for selected_idx in selected_indices]
+
+        if len(invalid_tokens) > 0:
+            print(f"Invalid selection(s): {' '.join(invalid_tokens)}")
+        user_input = input("Enter valid space-separated file number(s): ").strip()
+
+def prompt_source_mode():
+    """
+    Prompt the user for which saved analysis method to plot.
+    """
+    print("\nChoose which saved method(s) to plot:")
+    print("  1: Analysis_Script_fit_v1.py only")
+    print("  2: Analysis_Script_direct_compare.ipy only")
+    print("  3: both methods")
+    user_input = input("Enter 1, 2, or 3. Press enter for 3: ").strip()
+
+    if user_input == "":
+        return "both"
+    while user_input not in ("1", "2", "3"):
+        user_input = input("Enter 1, 2, or 3. Press enter for 3: ").strip()
+        if user_input == "":
+            return "both"
+    return {"1": "fit_v1", "2": "direct", "3": "both"}[user_input]
+
+def find_width_match(file_names, width_by_file_name):
+    """
+    Find the first file name with a matching ribbon width entry.
+    """
+    for file_name in file_names:
+        if file_name and file_name in width_by_file_name:
+            return file_name, width_by_file_name[file_name]
+    return next((file_name for file_name in file_names if file_name), "unknown image"), np.nan
+
+def get_curve_label(file_name, width_um, method_name):
+    """
+    Build a legend label from ribbon width, image file name, and method name.
+    """
+    if np.isfinite(width_um):
+        return f"{width_um:g} um - {file_name} - {method_name}"
+    return f"{file_name} - {method_name}"
+
+def get_fitvar_curves(rows, trace_id, source_mode, width_by_file_name):
+    """
+    Extract plottable displacement curves from saved fitvar rows.
+    """
+    curves = []
+    if source_mode in ("fit_v1", "both"):
+        x = numeric_column(rows, "fit_v1_x")
+        d = numeric_column(rows, "fit_v1_d_abs")
+        x, d = valid_xy(x, d)
+        if len(x) > 0:
+            file_name, width_um = find_width_match(
+                [
+                    rows[0].get("direct_pre_file_name"),
+                    rows[0].get("fit_v1_file_name"),
+                    trace_id,
+                ],
+                width_by_file_name,
+            )
+            curves.append({
+                "x": x,
+                "d": d,
+                "width_um": width_um,
+                "label": get_curve_label(file_name, width_um, "fit_v1"),
+            })
+
+    if source_mode in ("direct", "both"):
+        x = numeric_column(rows, "direct_x")
+        d = numeric_column(rows, "direct_d_abs")
+        x, d = valid_xy(x, d)
+        if len(x) > 0:
+            file_name, width_um = find_width_match(
+                [
+                    rows[0].get("direct_pre_file_name"),
+                    rows[0].get("direct_post_file_name"),
+                    trace_id,
+                ],
+                width_by_file_name,
+            )
+            curves.append({
+                "x": x,
+                "d": d,
+                "width_um": width_um,
+                "label": get_curve_label(file_name, width_um, "direct"),
+            })
+
+    return curves
+
+def next_bend_fit_plot_path():
+    """
+    Choose the next available output path for a combined bend-fit plot.
+    """
+    base_path = RESULTS_IMAGES_DIR / "bend_fit_plot.png"
+    numbered_paths = []
+    for path in RESULTS_IMAGES_DIR.glob("bend_fit_plot_*.png"):
+        suffix = path.stem.removeprefix("bend_fit_plot_")
+        if suffix.isdigit() and int(suffix) > 0:
+            numbered_paths.append((int(suffix), path))
+
+    if len(numbered_paths) > 0:
+        next_idx = max(idx for idx, _ in numbered_paths) + 1
+        return RESULTS_IMAGES_DIR / f"bend_fit_plot_{next_idx}.png"
+
+    if base_path.exists():
+        return RESULTS_IMAGES_DIR / "bend_fit_plot_2.png"
+
+    return base_path
+
+available_files = list_available_fitvar_files()
+if len(available_files) == 0:
+    raise FileNotFoundError("No results/fitvar_*.txt files found. Run an analysis script first.")
+
+fitvar_paths = prompt_fitvar_files(available_files)
+source_mode = prompt_source_mode()
+width_by_file_name = read_ribbon_widths()
+
+fig, ax = plt.subplots(figsize=(11, 6))
+curves = []
+for fitvar_path in fitvar_paths:
+    trace_id = fitvar_path.stem.removeprefix("fitvar_")
+    curves.extend(get_fitvar_curves(read_fitvar_file(fitvar_path), trace_id, source_mode, width_by_file_name))
+
+curves.sort(
+    key=lambda curve: (
+        not np.isfinite(curve["width_um"]),
+        curve["width_um"] if np.isfinite(curve["width_um"]) else np.inf,
+        curve["label"],
+    )
+)
+
+if len(curves) == 0:
+    raise ValueError("No plottable data found in the selected fitvar file(s) for the selected method.")
+
+for curve in curves:
+    ax.scatter(curve["x"], curve["d"], s=18, label=curve["label"])
+
+ax.set_xlabel("x (um)")
+ax.set_ylabel("d (um)")
+ax.tick_params(direction="in", top=True, right=True)
+ax.legend(loc="best")
+plt.tight_layout()
+output_path = next_bend_fit_plot_path()
+plt.savefig(output_path)
+print(f"Saved plot to {output_path}")
+plt.show()

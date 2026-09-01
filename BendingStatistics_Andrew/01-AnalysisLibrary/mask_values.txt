@@ -1,0 +1,27 @@
+mask -> x_split
+
+
+Analysis_Script_fit_v1.ipy:
+
+BBGcg0_tap_0011 (092504): 15
+bBLG_WSe2_push0011 (103453): 12
+cg20_AfterPush0004 (122303): 16
+cg24_push_0014 (125711): 20
+cg30_TapAfter0000 (132440): 33
+MBLG_cg26_Push2_0004 (154852): 36
+MBLG21_duringPush0007 (161441): 24
+
+-----------------------------------------------------
+
+Analysis_Script_direct_compare.ipy: 
+
+BBGcg0_tap_0001 (093438) and BBGcg0_tap_0011 (092504): 30
+new: 32
+
+bBLG_WSe2_push0000 (102120) and bBLG_WSe2_push0011 (103453): 28
+cg20_prepPush0003 (121630) and cg20_AfterPush0004 (122303): 26
+cg24_push_0000 (124358) and cg24_push_0014 (125711): 25
+cg30_TapBefore_0000 (131353) and cg30_TapAfter0000 (132440): 29
+MBLG_cg26_BeforePush_0003 (150624) and MBLG_cg26_Push2_0004 (154852): 34
+MBLG21_beforePush0002 (160427) and MBLG21_duringPush0007 (161441): 27
+
